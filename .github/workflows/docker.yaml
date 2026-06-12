@@ -114,19 +114,34 @@ jobs:
               new_repo_name="${org_part}_${image_name_tag}"
               target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$new_repo_name"
 
-              # 检查目标是否已存在且 digest 一致，一致则跳过
-              # skopeo copy 会保留所有平台，因此源和目标的 manifest list digest 自然一致
-              src_digest=$(skopeo inspect "docker://$full_image" --format '{{.Digest}}' 2>/dev/null || true)
-              if [ -z "$src_digest" ]; then
-                  echo ">>> ⚠️ 无法获取源镜像 digest，尝试继续同步: $full_image"
-              elif skopeo inspect "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                  dst_digest=$(skopeo inspect "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Digest}}' 2>/dev/null || true)
-                  if [ "$src_digest" = "$dst_digest" ]; then
-                      echo ">>> Skip (digest 相同): $full_image  ($src_digest)"
-                      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-                      continue
-                  else
-                      echo ">>> Digest 不同，需要更新: $full_image  ($dst_digest → $src_digest)"
+              # 比较源和目标是否一致，避免重复同步浮动 tag
+              # 多架构: 比较 manifest list 中各平台 digest（内容寻址，不受 JSON 重序列化影响）
+              # 单架构: 直接比较 image digest
+              raw=$(skopeo inspect --raw "docker://$full_image" 2>/dev/null || echo "")
+              is_list=$(echo "$raw" | jq -r '.mediaType // ""' 2>/dev/null || echo "")
+              if [[ "$is_list" == *"manifest.list"* ]] || [[ "$is_list" == *"index"* ]]; then
+                  # 多架构 manifest list：提取所有平台 digest 排序后比对
+                  src_fp=$(echo "$raw" | jq '[.manifests[]?.digest] | sort | join("|")' -r 2>/dev/null || echo "")
+                  if [ -n "$src_fp" ] && skopeo inspect "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
+                      dst_raw=$(skopeo inspect --raw "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" 2>/dev/null || echo "")
+                      dst_fp=$(echo "$dst_raw" | jq '[.manifests[]?.digest] | sort | join("|")' -r 2>/dev/null || echo "")
+                      if [ -n "$dst_fp" ] && [ "$src_fp" = "$dst_fp" ]; then
+                          echo ">>> Skip (所有平台 digest 一致): $full_image"
+                          SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                          continue
+                      fi
+                  fi
+              else
+                  # 单架构镜像：直接比对 digest
+                  src_digest=$(echo "$raw" | jq -r '.config.digest // empty' 2>/dev/null || echo "")
+                  if [ -n "$src_digest" ] && skopeo inspect "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
+                      dst_raw=$(skopeo inspect --raw "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" 2>/dev/null || echo "")
+                      dst_digest=$(echo "$dst_raw" | jq -r '.config.digest // empty' 2>/dev/null || echo "")
+                      if [ -n "$dst_digest" ] && [ "$src_digest" = "$dst_digest" ]; then
+                          echo ">>> Skip (digest 一致): $full_image"
+                          SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                          continue
+                      fi
                   fi
               fi
 
@@ -161,10 +176,17 @@ jobs:
       - name: 发送 Email 通知
         if: always()
         run: |
-          SUBJECT="${{ (env.FAILURE_COUNT > 0 && '❌ AliCR镜像同步失败') ||
-                      (env.SUCCESS_COUNT > 0 && '✅ AliCR镜像同步成功') ||
-                      '☕ 同步任务完成 (无新镜像)' }}"
-          BODY="阿里云镜像同步报告\n━━━━━━━━━━━━━━━━━━\n\n统计: 成功 ${SUCCESS_COUNT:-0} | 跳过 ${SKIPPED_COUNT:-0} | 失败 ${FAILURE_COUNT:-0}\n\n详细结果:\n${SYNC_RESULT:-无}\n\n查看详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf -v SUBJECT '%s' "${{ (env.FAILURE_COUNT > 0 && '❌ AliCR镜像同步失败') ||
+                                       (env.SUCCESS_COUNT > 0 && '✅ AliCR镜像同步成功') ||
+                                       '☕ 同步任务完成 (无新镜像)' }}"
+          printf -v DETAIL_URL '%s' "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY=$(printf '%s\n\n%s\n\n%s\n\n%s' \
+            "阿里云镜像同步报告" \
+            "━━━━━━━━━━━━━━━━━━" \
+            "统计: 成功 ${SUCCESS_COUNT:-0} | 跳过 ${SKIPPED_COUNT:-0} | 失败 ${FAILURE_COUNT:-0}" \
+            "详细结果: ${SYNC_RESULT:-无}" \
+            "" \
+            "查看详情: ${DETAIL_URL}")
           curl -s -X POST https://api.resend.com/emails \
             -H "Authorization: Bearer ${{ secrets.RESEND_API_KEY }}" \
             -H "Content-Type: application/json" \
