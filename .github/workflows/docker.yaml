@@ -33,6 +33,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Install skopeo & awscli
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo awscli
+          sudo rm -rf /var/lib/apt/lists/*
+
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -44,11 +50,6 @@ jobs:
 
       - name: Restart docker
         run: sudo service docker restart
-
-      - name: Install skopeo&awscli
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y skopeo awscli
 
       - name: Sync and Push to Aliyun
         id: sync_step
