@@ -56,8 +56,7 @@
 
 | Secret 名称 | 说明 | 样例值 | 必填 |
 |---|---|---|---|
-| `GCP_PROJECT_ID` | GCP 项目 ID | `my-project` | 按需 |
-| `GCP_SERVICE_ACCOUNT_KEY` | GCP 服务账号 JSON Key（需 Artifact Registry Reader 权限） | `{"type":"service_account",...}` | 按需 |
+| `GCP_SERVICE_ACCOUNT_KEY` | GCP 服务账号 JSON Key（需 Artifact Registry Reader 权限，项目 ID 已包含在 Key 中） | `{"type":"service_account",...}` | 按需 |
 
 #### Microsoft Container Registry (MCR / mcr.microsoft.com)
 
@@ -245,7 +244,7 @@ skopeo inspect docker://registry.cn-hangzhou.aliyuncs.com/my-namespace/library_n
    - 在 `images.txt` 中添加私有镜像，如 `ghcr.io/your-org/private-repo:tag`
 
 3. **Google Container Registry (gcr.io) 私有镜像**：
-   - 在 GitHub Secrets 中配置 `GCP_PROJECT_ID` 和 `GCP_SERVICE_ACCOUNT_KEY`
+   - 在 GitHub Secrets 中配置 `GCP_SERVICE_ACCOUNT_KEY`（项目 ID 已包含在 Key 中）
    - 在 `images.txt` 中添加私有镜像，如 `gcr.io/your-project/private-image:tag`
 
 4. **Azure Container Registry (ACR / *.azurecr.io) 私有镜像**：

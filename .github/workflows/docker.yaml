@@ -16,7 +16,6 @@ env:
   DOCKERHUB_USERNAME: "${{ secrets.DOCKERHUB_USERNAME }}"
   DOCKERHUB_PASSWORD: "${{ secrets.DOCKERHUB_PASSWORD }}"
   GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-  GCP_PROJECT_ID: "${{ secrets.GCP_PROJECT_ID }}"
   GCP_SERVICE_ACCOUNT_KEY: "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}"
   AZURE_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
   AZURE_CLIENT_SECRET: "${{ secrets.AZURE_CLIENT_SECRET }}"
@@ -46,8 +45,10 @@ jobs:
       - name: Restart docker
         run: sudo service docker restart
 
-      - name: Install skopeo
-        run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Install skopeo&awscli
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo awscli
 
       - name: Sync and Push to Aliyun
         id: sync_step
@@ -111,11 +112,20 @@ jobs:
               new_repo_name="${org_part}_${image_name_tag}"
               target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$new_repo_name"
 
-              # 使用 skopeo 检查目标镜像是否已存在，已存在则跳过
-              if skopeo inspect docker://$target_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                  echo ">>> Skip (already exists): $full_image"
-                  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-                  continue
+              # 使用 skopeo 通过 digest 比对：目标已存在且 digest 相同才跳过
+              # 这确保可变标签（:latest、:main、:dev 等）上游更新后能重新同步
+              src_digest=$(skopeo inspect "docker://$full_image" --format '{{.Digest}}' 2>/dev/null || true)
+              if [ -z "$src_digest" ]; then
+                  echo ">>> ⚠️ 无法获取源镜像 digest，尝试继续同步: $full_image"
+              elif skopeo inspect "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
+                  dst_digest=$(skopeo inspect "docker://$target_image" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Digest}}' 2>/dev/null || true)
+                  if [ "$src_digest" = "$dst_digest" ]; then
+                      echo ">>> Skip (digest 相同): $full_image  ($src_digest)"
+                      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                      continue
+                  else
+                      echo ">>> Digest 不同，需要更新: $full_image  ($dst_digest → $src_digest)"
+                  fi
               fi
 
               # 登录 Amazon ECR（如果镜像是 ECR 地址且配置了 AWS 凭证）
@@ -152,7 +162,7 @@ jobs:
         with:
           server_address: smtp.resend.com
           server_port: 465
-          username: ${{ secrets.RESEND_API_KEY }}
+          username: resend
           password: ${{ secrets.RESEND_API_KEY }}
           subject: >-
             ${{ (env.FAILURE_COUNT > 0 && '❌ AliCR镜像同步失败') ||
