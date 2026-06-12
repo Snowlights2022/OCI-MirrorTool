@@ -1,0 +1,172 @@
+name: Docker Image Sync to Aliyun
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'images.txt'
+
+env:
+  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
+  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
+  ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
+  ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+  DOCKERHUB_USERNAME: "${{ secrets.DOCKERHUB_USERNAME }}"
+  DOCKERHUB_PASSWORD: "${{ secrets.DOCKERHUB_PASSWORD }}"
+  GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+  GCP_PROJECT_ID: "${{ secrets.GCP_PROJECT_ID }}"
+  GCP_SERVICE_ACCOUNT_KEY: "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}"
+  AZURE_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+  AZURE_CLIENT_SECRET: "${{ secrets.AZURE_CLIENT_SECRET }}"
+  AZURE_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+  AZURE_REGISTRY_NAME: "${{ secrets.AZURE_REGISTRY_NAME }}"
+  AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+  AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+  AWS_REGION: "${{ secrets.AWS_REGION }}"
+
+jobs:
+  build:
+    name: Sync Images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 128
+          remove-dotnet: 'true'
+          remove-haskell: 'true'
+          build-mount-path: '/var/lib/docker/'
+
+      - name: Restart docker
+        run: sudo service docker restart
+
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+
+      - name: Sync and Push to Aliyun
+        id: sync_step
+        run: |
+          echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
+          
+          # 登录 Docker Hub（如果配置了凭证）
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_PASSWORD}" ]; then
+              echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          fi
+          
+          # 登录 GitHub Container Registry（如果配置了 Token）
+          if [ -n "${GITHUB_TOKEN}" ]; then
+              echo "$GITHUB_TOKEN" | docker login ghcr.io -u _ --password-stdin
+          fi
+          
+          # 登录 Google Container Registry（如果配置了凭证）
+          if [ -n "${GCP_SERVICE_ACCOUNT_KEY}" ]; then
+              echo "$GCP_SERVICE_ACCOUNT_KEY" | docker login gcr.io -u _json_key --password-stdin
+          fi
+          
+          # 登录 Azure Container Registry / ACR（*.azurecr.io，仅私有镜像需要）
+          # 注意: mcr.microsoft.com 是微软公开注册表，无需登录
+          if [ -n "${AZURE_CLIENT_ID}" ] && [ -n "${AZURE_CLIENT_SECRET}" ] && [ -n "${AZURE_TENANT_ID}" ] && [ -n "${AZURE_REGISTRY_NAME}" ]; then
+              az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+              az acr login --name "$AZURE_REGISTRY_NAME"
+          fi
+
+          SYNC_SUMMARY=""
+          SUCCESS_COUNT=0
+          FAILURE_COUNT=0
+          SKIPPED_COUNT=0
+
+          while IFS= read -r line || [ -n "$line" ]; do
+              # 跳过空行和以 # 开头的注释行
+              [[ -z "$line" ]] || [[ "$line" =~ ^\s*# ]] && continue
+              
+              # 取每行第一个字段作为镜像地址（支持行尾注释）
+              raw_image=$(echo "$line" | awk '{print $1}')
+              # 去除 @sha256:... 摘要后缀
+              full_image="${raw_image%%@*}"
+              # 取最后一段作为镜像名+标签
+              image_name_tag=$(echo "$full_image" | awk -F'/' '{print $NF}')
+              
+              # -------------------------------------------------------------------
+              # 多注册表支持：将源路径中的 / 统一替换为 _ 生成唯一目标仓库名
+              # 示例映射:
+              #   nginx:latest                          → library_nginx:latest
+              #   bitnami/redis:7                       → bitnami_redis:7
+              #   ghcr.io/owner/repo:tag                → ghcr.io_owner_repo:tag
+              #   gcr.io/project/image:tag               → gcr.io_project_image:tag
+              #   mcr.microsoft.com/dotnet/aspnet:8.0    → mcr.microsoft.com_dotnet_aspnet:8.0  (公开)
+              #   myacr.azurecr.io/your-app:tag           → myacr.azurecr.io_your-app:tag         (私有)
+              # -------------------------------------------------------------------
+              if [[ "$full_image" == *"/"* ]]; then
+                  org_part=$(echo "$full_image" | sed "s|\/${image_name_tag}||" | tr '/' '_')
+              else
+                  org_part="library"
+              fi
+              
+              new_repo_name="${org_part}_${image_name_tag}"
+              target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$new_repo_name"
+
+              # 使用 skopeo 检查目标镜像是否已存在，已存在则跳过
+              if skopeo inspect docker://$target_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
+                  echo ">>> Skip (already exists): $full_image"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                  continue
+              fi
+
+              # 登录 Amazon ECR（如果镜像是 ECR 地址且配置了 AWS 凭证）
+              if [[ "$full_image" == *"dkr.ecr."*".amazonaws.com"* ]] && [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ] && [ -n "${AWS_REGION}" ]; then
+                  ecr_registry=$(echo "$full_image" | cut -d'/' -f1)
+                  aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ecr_registry" 2>/dev/null
+              fi
+
+              # 执行同步: pull → tag → push
+              echo ">>> Syncing: $full_image → $target_image"
+              if docker pull "$full_image" && docker tag "$full_image" "$target_image" && docker push "$target_image"; then
+                  docker rmi "$full_image" "$target_image"
+                  SYNC_SUMMARY="${SYNC_SUMMARY}\n✅ ${full_image}"
+                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              else
+                  SYNC_SUMMARY="${SYNC_SUMMARY}\n❌ ${full_image} (同步失败)"
+                  FAILURE_COUNT=$((FAILURE_COUNT + 1))
+              fi
+          done < images.txt
+
+          # 写入环境变量供后续步骤使用
+          echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
+          echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
+          echo "SKIPPED_COUNT=$SKIPPED_COUNT" >> $GITHUB_ENV
+          {
+            echo 'SYNC_RESULT<<EOF'
+            echo -e "$SYNC_SUMMARY"
+            echo 'EOF'
+          } >> $GITHUB_ENV
+
+      - name: 发送 Email 通知
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.resend.com
+          server_port: 465
+          username: ${{ secrets.RESEND_API_KEY }}
+          password: ${{ secrets.RESEND_API_KEY }}
+          subject: >-
+            ${{ (env.FAILURE_COUNT > 0 && '❌ AliCR镜像同步失败') ||
+                (env.SUCCESS_COUNT > 0 && '✅ AliCR镜像同步成功') ||
+                '☕ 同步任务完成 (无新镜像)' }}
+          to: ${{ secrets.EMAIL_RECIPIENT }}
+          from: ${{ secrets.RESEND_SENDER_EMAIL }}
+          body: |
+            阿里云镜像同步报告
+            ━━━━━━━━━━━━━━━━━━
+            
+            统计: 成功 ${{ env.SUCCESS_COUNT }} | 跳过 ${{ env.SKIPPED_COUNT }} | 失败 ${{ env.FAILURE_COUNT }}
+            
+            详细结果:
+            ${{ env.SYNC_RESULT }}
+            
+            查看详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+

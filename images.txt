@@ -1,0 +1,56 @@
+# =============================================================================
+# 镜像同步列表 - 每行一个镜像地址，支持任意 Registry
+# 格式: <镜像名>:<标签>  (行尾可加注释)
+#
+# 支持的 Registry 及写法示例:
+#   Docker Hub:      nginx:latest                    (官方镜像，省略 registry)
+#   Docker Hub:      bitnami/redis:7                 (组织镜像)
+#   GitHub (ghcr):   ghcr.io/owner/repo:tag
+#   Google (gcr):    gcr.io/project/image:tag
+#   Microsoft (mcr): mcr.microsoft.com/dotnet/aspnet:8.0
+#   Quay.io:         quay.io/prometheus/prometheus:latest
+#   Amazon ECR:      123456789.dkr.ecr.us-east-1.amazonaws.com/app:tag
+# =============================================================================
+
+# --- Docker Hub 公开镜像 ---
+langgenius/dify-api:latest
+langgenius/dify-sandbox:0.2.14
+ubuntu/squid:latest
+redis:6-alpine
+akyakya/doris-mcp-server:latest
+
+# --- GitHub Container Registry (ghcr.io) 公开镜像 ---
+# ghcr.io/owner/repo:tag
+
+# --- Google Container Registry (gcr.io) 公开镜像 ---
+# gcr.io/project/image:tag
+
+# --- Microsoft Container Registry (mcr.microsoft.com) 公开镜像 ---
+# mcr.microsoft.com/dotnet/aspnet:8.0
+
+# --- Quay.io 公开镜像 ---
+# quay.io/prometheus/prometheus:latest
+
+# --- Amazon ECR 公开镜像 ---
+# public.ecr.aws/docker/library/nginx:latest
+
+# =============================================================================
+# 私有镜像示例（需要配置对应的认证 Secrets，详见 README）
+# =============================================================================
+
+# --- Docker Hub 私有镜像 ---
+# your-username/private-image:tag
+
+# --- GitHub Container Registry 私有镜像 ---
+# ghcr.io/your-org/private-repo:tag
+
+# --- Google Container Registry 私有镜像 ---
+# gcr.io/your-project/private-image:tag
+
+# --- Azure Container Registry (ACR) 私有镜像 ---
+# myacr.azurecr.io/your-app:tag
+# 注意: mcr.microsoft.com 是微软公开注册表（无需认证），放上面的公开区
+#       *.azurecr.io 是 Azure 私有注册表（需要 Azure 服务主体认证）
+
+# --- Amazon ECR 私有镜像 ---
+# 123456789.dkr.ecr.us-east-1.amazonaws.com/your-app:latest
