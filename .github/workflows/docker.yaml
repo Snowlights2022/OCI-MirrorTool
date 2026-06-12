@@ -114,8 +114,8 @@ jobs:
               new_repo_name="${org_part}_${image_name_tag}"
               target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$new_repo_name"
 
-              # 使用 skopeo 通过 digest 比对：目标已存在且 digest 相同才跳过
-              # 这确保可变标签（:latest、:main、:dev 等）上游更新后能重新同步
+              # 检查目标是否已存在且 digest 一致，一致则跳过
+              # skopeo copy 会保留所有平台，因此源和目标的 manifest list digest 自然一致
               src_digest=$(skopeo inspect "docker://$full_image" --format '{{.Digest}}' 2>/dev/null || true)
               if [ -z "$src_digest" ]; then
                   echo ">>> ⚠️ 无法获取源镜像 digest，尝试继续同步: $full_image"
@@ -130,16 +130,16 @@ jobs:
                   fi
               fi
 
-              # 登录 Amazon ECR（如果镜像是 ECR 地址且配置了 AWS 凭证）
+              # 对需要认证的源 registry 做 docker login（skopeo 会读取 ~/.docker/config.json）
+              # Amazon ECR
               if [[ "$full_image" == *"dkr.ecr."*".amazonaws.com"* ]] && [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ] && [ -n "${AWS_REGION}" ]; then
                   ecr_registry=$(echo "$full_image" | cut -d'/' -f1)
                   aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ecr_registry" 2>/dev/null
               fi
 
-              # 执行同步: pull → tag → push
+              # 使用 skopeo copy 直接在两个 registry 间复制（保留所有平台，不占本地磁盘）
               echo ">>> Syncing: $full_image → $target_image"
-              if docker pull "$full_image" && docker tag "$full_image" "$target_image" && docker push "$target_image"; then
-                  docker rmi "$full_image" "$target_image"
+              if skopeo copy "docker://$full_image" "docker://$target_image" --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD"; then
                   SYNC_SUMMARY="${SYNC_SUMMARY}\n✅ ${full_image}"
                   SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
               else
@@ -160,26 +160,18 @@ jobs:
 
       - name: 发送 Email 通知
         if: always()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.resend.com
-          server_port: 465
-          username: resend
-          password: ${{ secrets.RESEND_API_KEY }}
-          subject: >-
-            ${{ (env.FAILURE_COUNT > 0 && '❌ AliCR镜像同步失败') ||
-                (env.SUCCESS_COUNT > 0 && '✅ AliCR镜像同步成功') ||
-                '☕ 同步任务完成 (无新镜像)' }}
-          to: ${{ secrets.EMAIL_RECIPIENT }}
-          from: ${{ secrets.RESEND_SENDER_EMAIL }}
-          body: |
-            阿里云镜像同步报告
-            ━━━━━━━━━━━━━━━━━━
-            
-            统计: 成功 ${{ env.SUCCESS_COUNT }} | 跳过 ${{ env.SKIPPED_COUNT }} | 失败 ${{ env.FAILURE_COUNT }}
-            
-            详细结果:
-            ${{ env.SYNC_RESULT }}
-            
-            查看详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SUBJECT="${{ (env.FAILURE_COUNT > 0 && '❌ AliCR镜像同步失败') ||
+                      (env.SUCCESS_COUNT > 0 && '✅ AliCR镜像同步成功') ||
+                      '☕ 同步任务完成 (无新镜像)' }}"
+          BODY="阿里云镜像同步报告\n━━━━━━━━━━━━━━━━━━\n\n统计: 成功 ${SUCCESS_COUNT:-0} | 跳过 ${SKIPPED_COUNT:-0} | 失败 ${FAILURE_COUNT:-0}\n\n详细结果:\n${SYNC_RESULT:-无}\n\n查看详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer ${{ secrets.RESEND_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg from "${{ secrets.RESEND_SENDER_EMAIL }}" \
+              --arg to "${{ secrets.EMAIL_RECIPIENT }}" \
+              --arg subject "$SUBJECT" \
+              --arg body "$BODY" \
+              '{from: $from, to: [$to], subject: $subject, text: $body}')"
 
