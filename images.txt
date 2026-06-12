@@ -13,11 +13,11 @@
 # =============================================================================
 
 # --- Docker Hub 公开镜像 ---
-langgenius/dify-api:latest
-langgenius/dify-sandbox:0.2.14
-ubuntu/squid:latest
-redis:6-alpine
-akyakya/doris-mcp-server:latest
+python:3.13-slim
+sengokucola/maibot:main
+sengokucola/maibot:dev
+sengokucola/maibot:latest
+mlikiowa/napcat-docker:latest
 
 # --- GitHub Container Registry (ghcr.io) 公开镜像 ---
 # ghcr.io/owner/repo:tag
@@ -27,6 +27,7 @@ akyakya/doris-mcp-server:latest
 
 # --- Microsoft Container Registry (mcr.microsoft.com) 公开镜像 ---
 # mcr.microsoft.com/dotnet/aspnet:8.0
+mcr.microsoft.com/devcontainers/python:1-3.13-bookworm
 
 # --- Quay.io 公开镜像 ---
 # quay.io/prometheus/prometheus:latest
