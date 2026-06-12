@@ -36,8 +36,9 @@ jobs:
       - name: Install skopeo & awscli
         run: |
           sudo apt-get update
-          sudo apt-get install -y skopeo awscli
-          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get install -y skopeo python3-pip
+          pip3 install --no-cache-dir --break-system-packages awscli
+          sudo rm -rf /var/lib/apt/lists/* ~/.cache/pip
 
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
