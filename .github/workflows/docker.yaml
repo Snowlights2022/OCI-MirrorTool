@@ -155,7 +155,7 @@ jobs:
 
               # 使用 skopeo copy 直接在两个 registry 间复制（保留所有平台，不占本地磁盘）
               echo ">>> Syncing: $full_image → $target_image"
-              if skopeo copy "docker://$full_image" "docker://$target_image" --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD"; then
+              if skopeo copy --all "docker://$full_image" "docker://$target_image" --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD"; then
                   SYNC_SUMMARY="${SYNC_SUMMARY}\n✅ ${full_image}"
                   SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
               else

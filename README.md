@@ -182,48 +182,14 @@ services:
 
 ### 4.3 直接拉取阿里云镜像
 
-#### 方法一：使用 Docker CLI
-
 ```bash
 # 1. 登录阿里云容器镜像服务
-docker login your-registry.example.com
+docker login --username=yourusername your-registry.example.com
 
-# 2. 输入阿里云用户名和密码
-# 用户名：你的阿里云账号用户名
-# 密码：你的阿里云密码或 AccessKey Secret
-
-# 3. 拉取同步的镜像（把 images.txt 中的路径中的 / 替换为 _）
+# 2. 拉取同步的镜像（把 images.txt 中的路径中的 / 替换为 _）
 docker pull your-registry.example.com/my-namespace/library_nginx:latest        # nginx:latest
 docker pull your-registry.example.com/my-namespace/bitnami_redis:7              # bitnami/redis:7
 docker pull your-registry.example.com/my-namespace/ghcr.io_owner_repo:tag       # ghcr.io/owner/repo:tag
-```
-
-#### 方法二：使用 skopeo 检查和拉取
-
-```bash
-# 检查镜像是否存在
-skopeo inspect docker://your-registry.example.com/my-namespace/bitnami_redis:7
-
-# 拉取镜像
-skopeo copy docker://your-registry.example.com/my-namespace/bitnami_redis:7 docker-daemon:bitnami/redis:7
-```
-
-#### 方法三：在 Kubernetes 中使用
-
-```yaml
-# 在 Kubernetes YAML 文件中引用同步的镜像
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app
-spec:
-  template:
-    spec:
-      containers:
-      - name: my-app
-        image: your-registry.example.com/my-namespace/bitnami_redis:7
-        ports:
-        - containerPort: 80
 ```
 
 ### 4.4 常见问题
