@@ -123,16 +123,17 @@ jobs:
               raw_image=$(echo "$line" | awk '{print $1}')
               # 去除 @sha256:... 摘要后缀
               full_image="${raw_image%%@*}"
-              # 取最后一段作为镜像名+标签（保留变量名，避免后续逻辑误用旧映射）
-              image_name_tag=$(echo "$full_image" | awk -F'/' '{print $NF}')
               
               # -------------------------------------------------------------------
-              # 兼容直接拉取源格式：
-              # 阿里云目标 = AliyunRegistry/AliyunNamespace/<images.txt 中的源镜像路径>
-              # 例如：nginx:latest → AliyunRegistry/AliyunNamespace/nginx:latest
-              #       ghcr.io/owner/repo:tag → AliyunRegistry/AliyunNamespace/ghcr.io/owner/repo:tag
+              # 阿里云 ACR 仓库名不支持多级路径（如 sengokucola/maibot），
+              # 须将 / 替换为 _：sengokucola/maibot → sengokucola_maibot
               # -------------------------------------------------------------------
-              target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$full_image"
+              if [[ "$full_image" == *"/"* ]]; then
+                  repo_name="${full_image//\//_}"
+              else
+                  repo_name="library_${full_image}"
+              fi
+              target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$repo_name"
 
               # 比较源和目标是否一致，避免重复同步浮动 tag
               # 多架构: 比较 manifest list 中各平台 digest（内容寻址，不受 JSON 重序列化影响）
