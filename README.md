@@ -22,7 +22,7 @@
 
 | Secret 名称 | 说明 | 样例值 | 必填 |
 |---|---|---|---|
-| `ALIYUN_REGISTRY` | 阿里云容器镜像服务地址 | `registry.cn-hangzhou.aliyuncs.com` | ✅ |
+| `ALIYUN_REGISTRY` | 阿里云容器镜像服务地址 | `your-registry.example.com` | ✅ |
 | `ALIYUN_NAME_SPACE` | 阿里容器的命名空间（仓库组） | `my-namespace` | ✅ |
 | `ALIYUN_REGISTRY_USER` | 阿里云账号用户名 | `your-username` | ✅ |
 | `ALIYUN_REGISTRY_PASSWORD` | 阿里云账号密码或访问凭证 | `your-password` | ✅ |
@@ -143,15 +143,17 @@
 
 ### 4.1 镜像命名规则
 
-同步到阿里云的镜像会按照以下规则重命名：
+同步到阿里云的镜像**保留源镜像路径**，直接在阿里云 registry 和命名空间后面接上 `images.txt` 中的镜像地址：
 
-| 源镜像 | 阿里云目标仓库名 |
+| `images.txt` 中的写法 | 阿里云上的完整 URL |
 |---|---|
-| `nginx:latest` | `library_nginx:latest` |
-| `bitnami/redis:7` | `bitnami_redis:7` |
-| `ghcr.io/owner/repo:tag` | `ghcr.io_owner_repo:tag` |
-| `gcr.io/project/image:tag` | `gcr.io_project_image:tag` |
-| `mcr.microsoft.com/dotnet/aspnet:8.0` | `mcr.microsoft.com_dotnet_aspnet:8.0` |
+| `nginx:latest` | `your-registry.example.com/my-namespace/nginx:latest` |
+| `bitnami/redis:7` | `your-registry.example.com/my-namespace/bitnami/redis:7` |
+| `ghcr.io/owner/repo:tag` | `your-registry.example.com/my-namespace/ghcr.io/owner/repo:tag` |
+| `gcr.io/project/image:tag` | `your-registry.example.com/my-namespace/gcr.io/project/image:tag` |
+| `mcr.microsoft.com/dotnet/aspnet:8.0` | `your-registry.example.com/my-namespace/mcr.microsoft.com/dotnet/aspnet:8.0` |
+
+> `your-registry.example.com` 对应 `ALIYUN_REGISTRY`，`my-namespace` 对应 `ALIYUN_NAME_SPACE`。
 
 ### 4.2 拉取同步镜像的方法
 
@@ -159,26 +161,26 @@
 
 ```bash
 # 1. 登录阿里云容器镜像服务
-docker login registry.cn-hangzhou.aliyuncs.com
+docker login your-registry.example.com
 
 # 2. 输入阿里云用户名和密码
 # 用户名：你的阿里云账号用户名
 # 密码：你的阿里云密码或 AccessKey Secret
 
-# 3. 拉取同步的镜像
-docker pull registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest
-docker pull registry.cn-hangzhou.aliyuncs.com/my-namespace/bitnami_redis:7
-docker pull registry.cn-hangzhou.aliyuncs.com/my-namespace/ghcr.io_owner_repo:tag
+# 3. 拉取同步的镜像（把 images.txt 中的路径接在阿里云地址后面即可）
+docker pull your-registry.example.com/my-namespace/nginx:latest
+docker pull your-registry.example.com/my-namespace/bitnami/redis:7
+docker pull your-registry.example.com/my-namespace/ghcr.io/owner/repo:tag
 ```
 
 #### 方法二：使用 skopeo 检查和拉取
 
 ```bash
 # 检查镜像是否存在
-skopeo inspect docker://registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest
+skopeo inspect docker://your-registry.example.com/my-namespace/bitnami/redis:7
 
 # 拉取镜像
-skopeo copy docker://registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest docker-daemon:library_nginx:latest
+skopeo copy docker://your-registry.example.com/my-namespace/bitnami/redis:7 docker-daemon:bitnami/redis:7
 ```
 
 #### 方法三：在 Kubernetes 中使用
@@ -194,7 +196,7 @@ spec:
     spec:
       containers:
       - name: my-app
-        image: registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest
+        image: your-registry.example.com/my-namespace/bitnami/redis:7
         ports:
         - containerPort: 80
 ```
@@ -218,7 +220,7 @@ spec:
 1. 确认阿里云 Registry 地址是否正确
 2. 确认用户名和密码是否正确
 3. 确认命名空间是否正确
-4. 确认镜像名称是否正确（注意下划线替换）
+4. 确认阿里云 Registry、命名空间和镜像路径是否正确
 
 **Q4: 如何验证镜像是否已成功同步？**
 
@@ -228,7 +230,7 @@ spec:
 docker images | grep my-namespace
 
 # 或使用 skopeo
-skopeo inspect docker://registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest
+skopeo inspect docker://your-registry.example.com/my-namespace/bitnami/redis:7
 ```
 
 **Q5: 如何同步和拉取私有镜像？**
@@ -312,11 +314,11 @@ skopeo inspect docker://registry.cn-hangzhou.aliyuncs.com/my-namespace/library_n
 
 ```bash
 # 使用 skopeo 检查
-skopeo inspect docker://registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest
+skopeo inspect docker://your-registry.example.com/my-namespace/bitnami/redis:7
 
 # 或登录阿里云后拉取
-docker login registry.cn-hangzhou.aliyuncs.com
-docker pull registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest
+docker login your-registry.example.com
+docker pull your-registry.example.com/my-namespace/bitnami/redis:7
 ```
 
 ### Q3: 邮件通知发送失败怎么办？
@@ -338,13 +340,13 @@ docker pull registry.cn-hangzhou.aliyuncs.com/my-namespace/library_nginx:latest
 
 ### Q5: 镜像名称映射规则是什么？
 
-**A:** 工作流将源镜像路径中的 `/` 替换为 `_` 生成唯一目标仓库名：
+**A:** 工作流保留 `images.txt` 中的源镜像路径，在阿里云 registry 和命名空间后面直接拼接：
 
-| 源镜像 | 阿里云目标仓库名 |
+| 源镜像 | 阿里云目标镜像 |
 |---|---|
-| `nginx:latest` | `library_nginx:latest` |
-| `bitnami/redis:7` | `bitnami_redis:7` |
-| `ghcr.io/owner/repo:tag` | `ghcr.io_owner_repo:tag` |
-| `gcr.io/project/image:tag` | `gcr.io_project_image:tag` |
-| `mcr.microsoft.com/dotnet/aspnet:8.0` | `mcr.microsoft.com_dotnet_aspnet:8.0` |
+| `nginx:latest` | `your-registry.example.com/my-namespace/nginx:latest` |
+| `bitnami/redis:7` | `your-registry.example.com/my-namespace/bitnami/redis:7` |
+| `ghcr.io/owner/repo:tag` | `your-registry.example.com/my-namespace/ghcr.io/owner/repo:tag` |
+| `gcr.io/project/image:tag` | `your-registry.example.com/my-namespace/gcr.io/project/image:tag` |
+| `mcr.microsoft.com/dotnet/aspnet:8.0` | `your-registry.example.com/my-namespace/mcr.microsoft.com/dotnet/aspnet:8.0` |
 
