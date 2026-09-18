@@ -231,15 +231,9 @@ jobs:
 
               local plat_count=0
               local available=0
-              local plat_list=""
               local os arch variant
               while IFS=' ' read -r os arch variant; do
                   [ -z "$os" ] && continue
-                  if [ -n "$plat_list" ]; then
-                      plat_list="${plat_list},${os}/${arch}"
-                  else
-                      plat_list="${os}/${arch}"
-                  fi
                   plat_count=$((plat_count + 1))
               done <<< "$plats"
 
@@ -247,30 +241,33 @@ jobs:
               # 注意 runner 上的 skopeo 版本可能较老：--strip-removed-platforms 是较新
               # 版本才有的选项（实测 ubuntu-latest 报 unknown flag），--remove-list-signatures
               # 也未必存在。因此按"选项最全 → 逐步退化"依次尝试，避免因版本差异直接失败。
+              # a) 多架构重建。runner 上是 skopeo 1.13.3，--multi-arch 只支持
+              #    'system' / 'all' / 'index-only'（平台列表是更新版本才有的，
+              #    实测报 unknown multi-arch option）。因此按下面的顺序试：
+              #    a1) --all --format v2s2：强制目标端改用 Docker schema2。
+              #        attestation 清单是 OCI 空描述符制品，在 v2s2 下无法表达，
+              #        因此这条路径有机会既保留全部平台、又不产生被阿里云拒绝的
+              #        application/vnd.oci.empty.v1+json。
+              #    a2) --multi-arch index-only：sparse list，需要子 manifest 已存在。
+              #    a3) 逐个平台推送（最可靠，但 tag 只指向一个平台）。
+              local rebuild_err=""
               if [ "$plat_count" -gt 0 ]; then
-                  echo ">>> 多架构重建: --multi-arch ${plat_list}"
-                  local rebuild_err=""
-                  if rebuild_err=$(skopeo copy --multi-arch "$plat_list" --strip-removed-platforms \
-                          --remove-list-signatures \
+                  echo ">>> 多架构重建 a1: --all --format v2s2（转 Docker schema2，attestation 无法表达）"
+                  if rebuild_err=$(skopeo copy --all --format v2s2 \
                           "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
-                      echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
+                      echo ">>> ✓ 目标端已恢复为多架构清单"
                       return 0
                   fi
-                  echo ">>> ↻ 退化尝试: --multi-arch（不带 --strip-removed-platforms）"
-                  if rebuild_err=$(skopeo copy --multi-arch "$plat_list" --remove-list-signatures \
+                  echo ">>> ↻ a1 失败，最后一行: $(printf '%s' "$rebuild_err" | tail -n 1)"
+
+                  echo ">>> 多架构重建 a2: --multi-arch index-only"
+                  if rebuild_err=$(skopeo copy --multi-arch index-only \
                           "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
-                      echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
+                      echo ">>> ✓ 目标端已恢复为多架构清单"
                       return 0
                   fi
-                  echo ">>> ↻ 退化尝试: --multi-arch（仅此一个选项）"
-                  if rebuild_err=$(skopeo copy --multi-arch "$plat_list" \
-                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
-                      echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
-                      return 0
-                  fi
-                  # 只保留最后一行，避免把整段输出重复三遍刷屏
-                  echo ">>> ⚠️ 多架构重建失败，回退到逐个平台推送"
-                  echo ">>>    最后一次错误: $(printf '%s' "$rebuild_err" | tail -n 1)"
+                  echo ">>> ↻ a2 失败，最后一行: $(printf '%s' "$rebuild_err" | tail -n 1)"
+                  echo ">>> ⚠️ 多架构重建不可用（skopeo 1.13.3 无平台列表选项），回退到逐个平台推送"
               fi
 
               # b) 兜底：逐个平台单独推
