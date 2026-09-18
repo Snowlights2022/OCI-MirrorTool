@@ -243,11 +243,26 @@ jobs:
                   plat_count=$((plat_count + 1))
               done <<< "$plats"
 
-              # a) 精确平台列表复制
+              # a) 精确平台列表复制。
+              # 注意 runner 上的 skopeo 版本可能较老：--strip-removed-platforms 是较新
+              # 版本才有的选项（实测 ubuntu-latest 报 unknown flag），--remove-list-signatures
+              # 也未必存在。因此按"选项最全 → 逐步退化"依次尝试，避免因版本差异直接失败。
               if [ "$plat_count" -gt 0 ]; then
                   echo ">>> 多架构重建: --multi-arch ${plat_list}"
                   if skopeo copy --multi-arch "$plat_list" --strip-removed-platforms \
                           --remove-list-signatures \
+                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                      echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
+                      return 0
+                  fi
+                  echo ">>> ↻ 退化尝试: --multi-arch（不带 --strip-removed-platforms）"
+                  if skopeo copy --multi-arch "$plat_list" --remove-list-signatures \
+                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                      echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
+                      return 0
+                  fi
+                  echo ">>> ↻ 退化尝试: --multi-arch（仅此一个选项）"
+                  if skopeo copy --multi-arch "$plat_list" \
                           "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
                       echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
                       return 0
@@ -380,6 +395,8 @@ jobs:
       - name: 转储阿里云目标端状态
         if: always()
         run: |
+          echo ">>> skopeo 版本（决定可用选项）"
+          skopeo --version || true
           echo ">>> 阿里云目标端状态（不打印任何凭证）"
           while IFS= read -r line || [ -n "$line" ]; do
               [[ -z "$line" ]] || [[ "$line" =~ ^\s*# ]] && continue
