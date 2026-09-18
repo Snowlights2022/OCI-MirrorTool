@@ -192,20 +192,22 @@ jobs:
           }
 
           # -------------------------------------------------------------------
-          # 逐平台复制 + 索引重建，彻底绕开"含空描述符的 OCI index"。
+          # attestation 镜像的复制策略，两级：
           #
-          # 为什么不做"改写后的 index 再整份复制"：过滤后的 index 只存在于本地，
+          #   a) `--multi-arch <精确平台列表>`：skopeo-copy(1) 中该选项
+          #      "Copy only specific platforms"，只有列出的平台会被推上去，
+          #      attestation 子清单天然被排除；产出的是完整（非 sparse）
+          #      manifest list —— 既是多架构，又不含 application/vnd.oci.empty.v1+json。
+          #   b) 兜底：逐个平台单独推（`--override-os/--override-arch`），
+          #      tag 最终指向其中一个平台，其余平台按 digest 并存。
+          #
+          # 为什么不用"改写后的 index 再整份复制"：过滤后的 index 只存在于本地，
           # 其子清单仍在远端 registry，skopeo 无法用本地 oci: 引用去远端取子清单，
           # 那样必然 manifest unknown。
           #
-          # 所以分两步：
-          #   2a) 逐个平台单独推 —— 目标端每个制品都是普通的单架构 manifest，
-          #       不产生 application/vnd.oci.empty.v1+json（这正是阿里云拒绝的东西）。
-          #   2b) 再用 --multi-arch index-only 让 skopeo 重新组装一个索引：
-          #       此时两个平台的子清单都已在目标仓库里，skopeo 只需补缺失的那个，
-          #       然后推一个只含平台子清单的 index/list（不含 attestation）。
-          #       成功 → 目标端仍是完整多架构，docker pull 自动选平台；
-          #       失败 → 保持 2a 的结果（单架构 tag），并打警告，不算同步失败。
+          # 为什么不用 `--multi-arch index-only`：它会生成 sparse manifest list，
+          # 实测阿里云返回 `blob unknown to registry` 而拒绝（文档也提示 sparse list
+          # 通常需要子 manifest 已可解析）。完整列表这条路更可靠。
           # -------------------------------------------------------------------
           copy_per_platform() {
               local index_json="$1"
@@ -213,15 +215,14 @@ jobs:
               local dst="$3"
               local dest_creds="$4"
 
-              # 输出四列：os / arch / variant / digest。
-              # 注意 variant 可能为空，但 read 会把连续空白折叠，字段不会错位；
-              # 若按 `read -r os arch variant` 只读三列，digest 会被塞进 variant（曾踩过）。
+              # 输出三列：os / arch / variant。variant 可能为空，read 会折叠连续空白，
+              # 字段不会错位（注意别写成只读两列，否则 variant/digest 会串位）。
               local plats
               plats=$(echo "$index_json" | jq -r '
                   .manifests[]?
                   | select((.platform.os // "") != "unknown")
                   | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
-                  | "\(.platform.os) \(.platform.architecture) \(.platform.variant // "") \(.digest)"' 2>/dev/null || echo "")
+                  | "\(.platform.os) \(.platform.architecture) \(.platform.variant // "")"' 2>/dev/null || echo "")
 
               if [ -z "$plats" ]; then
                   echo ">>> 未在清单中找到可用平台"
@@ -230,8 +231,32 @@ jobs:
 
               local plat_count=0
               local available=0
-              local os arch variant digest dref
-              while IFS=' ' read -r os arch variant digest; do
+              local plat_list=""
+              local os arch variant
+              while IFS=' ' read -r os arch variant; do
+                  [ -z "$os" ] && continue
+                  if [ -n "$plat_list" ]; then
+                      plat_list="${plat_list},${os}/${arch}"
+                  else
+                      plat_list="${os}/${arch}"
+                  fi
+                  plat_count=$((plat_count + 1))
+              done <<< "$plats"
+
+              # a) 精确平台列表复制
+              if [ "$plat_count" -gt 0 ]; then
+                  echo ">>> 多架构重建: --multi-arch ${plat_list}"
+                  if skopeo copy --multi-arch "$plat_list" --strip-removed-platforms \
+                          --remove-list-signatures \
+                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                      echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
+                      return 0
+                  fi
+                  echo ">>> ⚠️ 多架构重建失败，回退到逐个平台推送"
+              fi
+
+              # b) 兜底：逐个平台单独推
+              while IFS=' ' read -r os arch variant; do
                   [ -z "$os" ] && continue
                   echo ">>> 按平台推送: ${os}/${arch}${variant:+/$variant}"
                   if ! retry_copy "$src_ref" "$dst" "$dest_creds" 3 \
@@ -239,53 +264,10 @@ jobs:
                       echo ">>> ✗ 平台 ${os}/${arch} 推送失败"
                       return 1
                   fi
-                  plat_count=$((plat_count + 1))
-
-                  # 该平台在目标端的 digest 与源一致（复制不改变内容摘要），
-                  # 因此可以直接用源 digest 组装索引引用。
-                  if [ -n "$digest" ] && [ "$digest" != "null" ]; then
-                      dref="${dst}@${digest}"
-                      echo ">>> 登记平台摘要以便组装索引: ${digest}"
-                      # 把该平台的 manifest 也按 digest 存入目标仓库：
-                      # Aliyun 在 PUT index 时会校验被引用的子 manifest 是否可解析，
-                      # 只按 tag 推过的话会报 "blob unknown to registry"。
-                      # 摘要取自源索引，选择器必须与源子清单完全一致，
-                      # 否则 skopeo 会重新序列化 manifest 而改变摘要。
-                      # 用 --format v2s2 转成 Docker schema2：一是这是所有 registry
-                      # 都支持的格式，二是让目标端 digest 与源索引里记录的 digest 对齐
-                      # （按 tag 推时 skopeo 可能保留 OCI 媒体类型，导致摘要不同）。
-                      local da=0
-                      while [ "$da" -lt 3 ]; do
-                          if skopeo copy "docker://$src_ref" "$dref" --dest-creds "$dest_creds" \
-                                  --format v2s2 \
-                                  --override-os "$os" --override-arch "$arch" ${variant:+--override-variant "$variant"} > /dev/null 2>&1; then
-                              available=$((available + 1))
-                              break
-                          fi
-                          da=$((da + 1))
-                          sleep 3
-                      done
-                  fi
+                  available=$((available + 1))
               done <<< "$plats"
 
-              # 2b) 索引重建：仅在确实推了多个平台、且子 manifest 都可解析时才有意义
-              #
-              # 依据 skopeo-copy(1)：`--multi-arch index-only` "creates a sparse manifest
-              # list, which usually fail unless the referenced per-architecture images are
-              # already present in the destination"。上面的逐平台推送 + 按 digest 登记
-              # 正好满足这个前提。这里不带 --all，否则 attestation 子清单又会被卷进来。
-              if [ "$plat_count" -gt 1 ] && [ "$available" -ge "$plat_count" ]; then
-                  echo ">>> 索引重建: 组装 ${plat_count} 平台的多架构清单（index-only，不带 attestation）"
-                  if skopeo copy --multi-arch index-only \
-                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
-                      echo ">>> ✓ 目标端已恢复为多架构清单"
-                  else
-                      echo ">>> ⚠️ 索引重建失败：目标端将保持单架构 tag（各平台仍可按 digest 拉取）"
-                  fi
-              elif [ "$plat_count" -gt 1 ]; then
-                  echo ">>> ⚠️ 目标端未能按 digest 登记全部平台（${available}/${plat_count}），跳过索引重建"
-              fi
-
+              echo ">>> ⚠️ 目标端为单架构 tag（各平台仍可按 digest 拉取），可用平台数: ${available}"
               return 0
           }
 
