@@ -295,11 +295,26 @@ skopeo inspect --raw docker://your-registry.example.com/my-namespace/sengokucola
   第 2 个是 attestation 清单被拒。凡是「平台数 × 2」的镜像都属于这一类。
 - **本工作流的处理**：`copy_image()` 分两步降级：
   1. 原样整份复制，失败后……
-  2. **逐平台复制**（`--override-os/--override-arch`），让目标端每个制品都是普通单架构 manifest，
-     从根上绕开空描述符；随后再用 `skopeo copy --multi-arch index-only` **重建索引**
-     （此时各平台子清单已在目标仓库里，只需推一个只含平台条目的 index/list）。
-- **结果**：索引重建成功 → 目标端仍是完整多架构清单，`docker pull` 行为与普通镜像完全一致；
-  索引重建失败 → 目标端保持单架构 tag（各平台仍按 digest 并存），处理方法见 Q10。
+  2. 先尝试 `skopeo copy --multi-arch <平台列表>` 做**多架构重建**：只复制列出的平台，
+     attestation 子清单天然被排除，产出的是完整（非 sparse）manifest list——
+     这是「多架构 + 不含空描述符」的正解；
+     该选项需要较新的 skopeo，**在 ubuntu-latest 自带的 1.13.3 上不可用**，
+     会打印一行「当前 skopeo 不支持平台列表」后继续降级；
+  3. 兜底：**逐平台复制**（`--override-os/--override-arch`），
+     目标端每个制品都是普通单架构 manifest，从根上绕开空描述符。
+- **结果**：
+  - 多架构重建成功 → 目标端仍是完整多架构清单，`docker pull` 行为与普通镜像完全一致；
+  - 落到逐平台兜底 → 目标端是**单架构 tag**（tag 指向最后一个被推送的平台，
+    实测为 arm64），其余平台按 digest 并存，按 Q10 处理。
+  - 实测当前环境（skopeo 1.13.3）走的是兜底路径：`python:3.13-slim`、
+    `mcr.microsoft.com/devcontainers/python:1-3.13-bookworm` 保持多架构（16 / 4 个平台），
+    而 maibot 三个 tag 与 `napcat-docker:latest` 为单架构。
+- **为什么没有直接升级 skopeo**：`containers/skopeo` 的 GitHub release 只有源码、
+  没有预编译二进制；从 `quay.io/skopeo/stable` 官方镜像里 copy 出的二进制依赖
+  Debian 的 `libsubid.so.5`，在 Ubuntu runner 上补装该库后仍无法运行。
+  保留一个随时可能把同步搞挂的安装步骤不划算，因此接受该限制。
+  如果将来需要多架构，可在 `images.txt` 里改用上游已去掉 attestation 的镜像，
+  或自行用 buildx 以 `provenance: false, sbom: false` 重新构建。
 - **上游根治**：如果是你自己的镜像，构建时加 `provenance: false, sbom: false`（buildx），
   例如 `docker/build-push-action@v6` 的 `with:` 里加上这两项。
 - **为什么以前能成功、后来突然失败**：阿里云侧的制品类型准入规则会变，
@@ -313,9 +328,9 @@ skopeo inspect --raw docker://your-registry.example.com/my-namespace/sengokucola
 现已改为在邮件步骤通过 `env:` 读取计数、再在 shell 内用 `$FAILURE_COUNT` 判断，
 主题分为四种：`✅ 成功` / `⚠️ 部分失败` / `❌ 失败` / `☕ 无新镜像`。
 
-**Q10: 日志里出现「索引重建失败」，arm64 机器拉不到镜像怎么办？**
+**Q10: 目标端是单架构 tag，arm64 机器拉不到镜像怎么办？**
 
-**A:** 这表示目标端只留下了单架构 tag（tag 指向最后一个被推送的平台，通常是 arm64）。
+**A:** 这表示该镜像走了逐平台兜底路径（多架构重建在当前 skopeo 版本下不可用）。
 先按 Q4.1 确认目标端形态，再按需处理：
 
 ```bash
