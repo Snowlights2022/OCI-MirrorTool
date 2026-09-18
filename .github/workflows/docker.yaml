@@ -249,25 +249,28 @@ jobs:
               # 也未必存在。因此按"选项最全 → 逐步退化"依次尝试，避免因版本差异直接失败。
               if [ "$plat_count" -gt 0 ]; then
                   echo ">>> 多架构重建: --multi-arch ${plat_list}"
-                  if skopeo copy --multi-arch "$plat_list" --strip-removed-platforms \
+                  local rebuild_err=""
+                  if rebuild_err=$(skopeo copy --multi-arch "$plat_list" --strip-removed-platforms \
                           --remove-list-signatures \
-                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
                       echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
                       return 0
                   fi
                   echo ">>> ↻ 退化尝试: --multi-arch（不带 --strip-removed-platforms）"
-                  if skopeo copy --multi-arch "$plat_list" --remove-list-signatures \
-                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                  if rebuild_err=$(skopeo copy --multi-arch "$plat_list" --remove-list-signatures \
+                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
                       echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
                       return 0
                   fi
                   echo ">>> ↻ 退化尝试: --multi-arch（仅此一个选项）"
-                  if skopeo copy --multi-arch "$plat_list" \
-                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                  if rebuild_err=$(skopeo copy --multi-arch "$plat_list" \
+                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
                       echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
                       return 0
                   fi
+                  # 只保留最后一行，避免把整段输出重复三遍刷屏
                   echo ">>> ⚠️ 多架构重建失败，回退到逐个平台推送"
+                  echo ">>>    最后一次错误: $(printf '%s' "$rebuild_err" | tail -n 1)"
               fi
 
               # b) 兜底：逐个平台单独推
