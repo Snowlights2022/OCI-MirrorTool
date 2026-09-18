@@ -52,28 +52,6 @@ jobs:
           pip3 install --no-cache-dir --break-system-packages awscli
           sudo rm -rf /var/lib/apt/lists/* ~/.cache/pip
 
-      # ubuntu-latest 自带的 skopeo 是 1.13.3，存在两个硬伤：
-      #   1) --multi-arch 只支持 system/all/index-only，没有平台列表，
-      #      无法"只复制指定平台"（这是既能保留多架构又能排除 attestation 的正解）；
-      #   2) 遇到 buildx 的 attestation 清单会报
-      #      "unsupported image-specific operation on artifact with type
-      #       application/vnd.docker.attestation.manifest.v1+json"。
-      # 因此改装上游最新的静态构建（单文件，无需编译）。
-      # 失败时不阻断：下面的复制逻辑对旧版本有降级路径，只是会退化成单架构 tag。
-      - name: Install latest skopeo (static)
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://api.github.com/repos/containers/skopeo/releases/latest \
-                | jq -r '.tag_name' | sed 's/^v//')
-          echo ">>> 上游最新 skopeo: v${ver}"
-          base="https://github.com/containers/skopeo/releases/download/v${ver}"
-          curl -fsSL -o /tmp/skopeo "${base}/skopeo-linux-amd64"
-          curl -fsSL -o /tmp/skopeo.asc "${base}/skopeo-linux-amd64.asc" || true
-          sudo install -m 0755 /tmp/skopeo /usr/local/bin/skopeo
-          hash -r
-          echo ">>> 生效版本: $(skopeo --version)"
-
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -85,6 +63,29 @@ jobs:
 
       - name: Restart docker
         run: sudo service docker restart
+
+      # ubuntu-latest 自带的 skopeo 是 1.13.3，有两个硬伤，导致带 buildx attestation
+      # 的多架构镜像只能退化成"单架构 tag"：
+      #   1) --multi-arch 只接受 system/all/index-only，没有平台列表选项；
+      #   2) 遇到 attestation 清单直接报 unsupported image-specific operation on
+      #      artifact with type application/vnd.docker.attestation.manifest.v1+json，
+      #      连 --all --format v2s2 也走不通。
+      # containers/skopeo 的 release 里没有预编译二进制（只有源码），所以从官方镜像
+      # 里取二进制。必须放在 maximize-build-space 与 docker 重启之后，否则会被
+      # 重新挂载的 /var/lib/docker 冲掉。
+      # 整段 continue-on-error：拿不到就沿用系统版本，下面的复制逻辑自带降级路径，
+      # 只是会退化成单架构 tag，不会让同步失败。
+      - name: Install newer skopeo (from official image)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          docker pull quay.io/skopeo/stable:latest
+          cid=$(docker create quay.io/skopeo/stable:latest)
+          docker cp "$cid:/usr/bin/skopeo" /tmp/skopeo-new
+          docker rm -f "$cid" > /dev/null
+          sudo install -m 0755 /tmp/skopeo-new /usr/local/bin/skopeo
+          hash -r
+          echo ">>> $(command -v skopeo) -> $(skopeo --version)"
 
       - name: Sync and Push to Aliyun
         id: sync_step
