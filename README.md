@@ -1,432 +1,302 @@
-# Docker 镜像同步到阿里云 - 使用指南
+# OCI Mirror Tool
+这是一个由 GitHub Actions 驱动的 OCI/Docker 镜像同步工具。它从 `images.txt` 读取源镜像，使用 `skopeo` 在源 Registry 与阿里云容器镜像服务之间直接复制，不需要把镜像完整下载到 Runner 本地。
 
-本文档详细说明如何配置 GitHub Actions 工作流，以及如何在 Docker 中拉取不同注册表的镜像。
+工作流支持公开镜像，也支持 Docker Hub、GHCR、GCR、Azure Container Registry 和 Amazon ECR 的私有镜像。对于带 buildx attestation 的 OCI 清单，工作流会先尝试完整复制；如果阿里云拒绝 attestation，则剔除证明清单，按平台复制后重新组装为完整的多架构 manifest list。
 
----
+## 目录
 
-## 📋 目录
+- [前置条件](#前置条件)
+- [快速开始](#快速开始)
+- [镜像名称映射](#镜像名称映射)
+- [拉取同步镜像](#拉取同步镜像)
+- [Secrets 与私有 Registry](#secrets-与私有-registry)
+- [阿里云配置](#阿里云配置)
+- [Resend 邮件通知](#resend-邮件通知)
+- [Attestation 与多架构行为](#attestation-与多架构行为)
+- [常见问题](#常见问题)
+- [本地验证](#本地验证)
+- [支持范围](#支持范围)
 
-- [一、GitHub Secrets 配置](#一github-secrets-配置)
-- [二、阿里云容器镜像服务配置](#二阿里云容器镜像服务配置)
-- [三、使用ReSend配置邮件通知](#三使用ReSend配置邮件通知)
-- [四、从阿里云拉取同步镜像](#四从阿里云容器镜像服务拉取同步镜像)
-- [五、常见问题](#五常见问题)
+## 前置条件
 
----
+- 一个启用 GitHub Actions 的 GitHub 仓库；
+- 一个可推送镜像的阿里云容器镜像服务命名空间；
+- `images.txt` 中至少有一个有效的镜像引用；
+- 如需同步私有源镜像，再配置对应 Registry 的凭据；
+- 如需本地验证，准备 Node.js、Git Bash 或 WSL；本地 fixture 验证另外需要 `jq`。
 
-## 一、GitHub Secrets 配置
+本项目不需要本地 Docker daemon 才能执行同步。GitHub-hosted Runner 会安装 `skopeo`，并在 Registry 之间直接复制镜像清单和层。
 
-在 GitHub 仓库中配置以下 Secrets，路径：`Settings` → `Secrets and variables` → `Actions` → `New repository secret`
+## 快速开始
 
-### 1.1 阿里云相关配置
+### 1. 配置必需 Secrets
 
-| Secret 名称 | 说明 | 样例值 | 必填 |
-|---|---|---|---|
-| `ALIYUN_REGISTRY` | 阿里云容器镜像服务地址 | `your-registry.example.com` | ✅ |
-| `ALIYUN_NAME_SPACE` | 阿里容器的命名空间（仓库组） | `my-namespace` | ✅ |
-| `ALIYUN_REGISTRY_USER` | 阿里云账号用户名 | `your-username` | ✅ |
-| `ALIYUN_REGISTRY_PASSWORD` | 阿里云账号密码或访问凭证 | `your-password` | ✅ |
+在 GitHub 仓库中打开 `Settings` → `Secrets and variables` → `Actions`，至少创建以下 Secrets：
 
-### 1.2 邮件通知相关配置
-
-| Secret 名称 | 说明 | 样例值 | 必填 |
-|---|---|---|---|
-| `RESEND_API_KEY` | Resend API Key（推荐） | `re_xxxxxxxxxxxxxxxxxxxxxxxxxx` | ✅ |
-| `RESEND_SENDER_EMAIL` | 发件人邮箱（需在 Resend 中验证） | `noreply@yourdomain.com` | ✅ |
-| `EMAIL_RECIPIENT` | 收件人邮箱地址 | `admin@company.com` | ✅ |
-
-### 1.3 各注册表认证配置（按需配置）
-
-以下 Secrets 仅在需要同步对应注册表的**私有镜像**时才需配置。公开镜像无需配置。
-
-#### Docker Hub
-
-| Secret 名称 | 说明 | 样例值 | 必填 |
-|---|---|---|---|
-| `DOCKERHUB_USERNAME` | Docker Hub 用户名 | `your-username` | 按需 |
-| `DOCKERHUB_PASSWORD` | Docker Hub 密码或 Access Token | `your-password` | 按需 |
-
-#### GitHub Container Registry (ghcr.io)
-
-| Secret 名称 | 说明 | 样例值 | 必填 |
-|---|---|---|---|
-| `GITHUB_TOKEN` | GitHub Personal Access Token（需 `read:packages` 权限） | `ghp_xxxxxxxxxxxx` | 按需 |
-
-#### Google Container Registry (gcr.io)
-
-| Secret 名称 | 说明 | 样例值 | 必填 |
-|---|---|---|---|
-| `GCP_SERVICE_ACCOUNT_KEY` | GCP 服务账号 JSON Key（需 Artifact Registry Reader 权限，项目 ID 已包含在 Key 中） | `{"type":"service_account",...}` | 按需 |
-
-#### Microsoft Container Registry (MCR / mcr.microsoft.com)
-
-> **公开注册表，无需配置任何 Secrets**。
-> 例如 `mcr.microsoft.com/dotnet/aspnet:8.0` 可直接在 `images.txt` 中列出，无需认证。
-
-#### Azure Container Registry (ACR / *.azurecr.io)
-
-> **私有注册表**，需要 Azure 服务主体认证。
-
-| Secret 名称 | 说明 | 样例值 | 必填 |
-|---|---|---|---|
-| `AZURE_CLIENT_ID` | Azure 服务主体 Client ID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | 按需 |
-| `AZURE_CLIENT_SECRET` | Azure 服务主体 Client Secret | `xxxxxxxxxxxxxxxxxxxxxxxx` | 按需 |
-| `AZURE_TENANT_ID` | Azure 租户 ID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | 按需 |
-| `AZURE_REGISTRY_NAME` | Azure 容器注册表名称（不含 `.azurecr.io`） | `myacr` | 按需 |
-
-#### Amazon ECR
-
-| Secret 名称 | 说明 | 样例值 | 必填 |
-|---|---|---|---|
-| `AWS_ACCESS_KEY_ID` | AWS Access Key ID | `AKIAXXXXXXXXXXXX` | 按需 |
-| `AWS_SECRET_ACCESS_KEY` | AWS Secret Access Key | `xxxxxxxxxxxxxxxxxxxxxxxx` | 按需 |
-| `AWS_REGION` | AWS 区域 | `us-east-1` | 按需 |
-
----
-
-## 二、阿里云容器镜像服务配置
-
-### 2.1 获取阿里云 Registry 地址
-
-阿里云提供多个地域的镜像服务，根据你的个人版地域情况和页面显示选择即可。
-
-### 2.2 创建命名空间
-
-1. 登录 [阿里云容器镜像服务控制台](https://cr.console.aliyun.com/)
-2. 选择左侧菜单 `命名空间`
-3. 点击 `创建命名空间`
-4. 输入命名空间名称（如 `my-namespace`）
-5. 选择 `公开` 或 `私有`
-6. `确定` 创建
-
-### 2.3 获取访问凭证
-
-**方式一：使用阿里云账号密码**
-
-直接使用阿里云账号的 `AccessKey ID` 和 `AccessKey Secret`。
-
-**方式二：使用 RAM 子账号（推荐）**
-
-1. 登录 [阿里云 RAM 控制台](https://ram.console.aliyun.com/)
-2. 创建用户，勾选 `OpenAPI 访问`
-3. 创建后，获取 `AccessKey ID` 和 `AccessKey Secret`
-4. 为用户添加权限策略：
-   - 推荐策略：`AliyunContainerRegistryFullAccess`（容器镜像服务完整权限）
-   - 或自定义策略，仅授予 `push` 和 `pull` 权限
-
----
-
-## 三、使用ReSend配置邮件通知
-
-1. **注册 Resend 账户**
-   - 访问 [Resend 官网](https://resend.com/)
-   - 注册免费账户（无需信用卡）
-
-2. **获取 API Key**
-   - 登录 Resend 控制台
-   - 进入 `API Keys` 页面
-   - 点击 `Create API Key`
-   - 生成并复制 API Key（格式：`re_xxxxxxxxxxxxxxxxxxxxxxxxxx`）
-
-3. **验证发件人邮箱**
-   - 进入 `Emails` → `Add Sender`
-   - 输入发件人邮箱（如 `noreply@yourdomain.com`）
-   - 按照提示完成邮箱验证（通常需要点击确认链接）
-   - 验证完成后，使用该邮箱作为发件人
-
-4. **配置 GitHub Secrets**
-   - `RESEND_API_KEY`：填入获取的 API Key
-   - `RESEND_SENDER_EMAIL`：填入已验证的发件人邮箱
-   - `EMAIL_RECIPIENT`：填入接收通知的邮箱
-
-## 四、从阿里云容器镜像服务拉取同步镜像
-
-### 4.1 镜像命名规则
-
-> **重要**：阿里云 ACR 仓库名不支持多级路径（`/`），因此源镜像路径中的 `/` 会被替换为 `_`。
-
-| `images.txt` 中的写法 | 阿里云上的完整 URL |
+| Secret | 用途 |
 |---|---|
-| `nginx:latest` | `your-registry.example.com/my-namespace/library_nginx:latest` |
-| `bitnami/redis:7` | `your-registry.example.com/my-namespace/bitnami_redis:7` |
-| `ghcr.io/owner/repo:tag` | `your-registry.example.com/my-namespace/ghcr.io_owner_repo:tag` |
-| `gcr.io/project/image:tag` | `your-registry.example.com/my-namespace/gcr.io_project_image:tag` |
-| `mcr.microsoft.com/dotnet/aspnet:8.0` | `your-registry.example.com/my-namespace/mcr.microsoft.com_dotnet_aspnet:8.0` |
+| `ALIYUN_REGISTRY` | 阿里云 Registry 地址，例如 `registry.cn-hangzhou.aliyuncs.com` |
+| `ALIYUN_NAME_SPACE` | 阿里云命名空间 |
+| `ALIYUN_REGISTRY_USER` | 阿里云登录用户名 |
+| `ALIYUN_REGISTRY_PASSWORD` | 阿里云密码或访问凭证 |
+| `RESEND_API_KEY` | Resend API Key |
+| `RESEND_SENDER_EMAIL` | 已在 Resend 验证的发件人邮箱 |
+| `EMAIL_RECIPIENT` | 接收同步报告的邮箱 |
 
-> `your-registry.example.com` 对应 `ALIYUN_REGISTRY`，`my-namespace` 对应 `ALIYUN_NAME_SPACE`。
+目标 Registry 登录失败是硬错误，工作流会立即失败并发送失败报告。邮件发送失败不会覆盖镜像同步结果。
 
-### 4.2 在 Docker Compose 中使用
+### 2. 编辑镜像清单
 
-由于阿里云仓库名经过 `/`→`_` 映射，compose 中需将原镜像名替换为阿里云路径：
+每行写一个镜像引用，支持 tag、digest 和行尾注释。空行以及以 `#` 开头的行会被忽略。
 
-```yaml
-# 原 compose
-services:
-  app:
-    image: bitnami/redis:7
-
-# 改为（/ 替换为 _）
-services:
-  app:
-    image: your-registry.example.com/my-namespace/bitnami_redis:7
+```text
+python:3.13-slim
+ghcr.io/example/project:latest
+nginx:1.27 # 行尾注释
+ubuntu@sha256:<digest>
 ```
 
-**映射对照速查：**
+建议生产环境使用固定 digest；使用浮动 tag 时，工作流会通过源端和目标端的 digest 比对跳过未变化的镜像。
 
-| 原 compose 中的 image | 阿里云上的 image |
+### 3. 运行工作流
+
+`.github/workflows/docker.yaml` 支持三种触发方式：
+
+- 在 `main` 分支修改 `images.txt` 后自动运行；
+- 每 6 小时定时运行一次，时间为 UTC 的 20、02、08、14 点，即北京时间 04、10、16、22 点；
+- 在 GitHub 仓库的 `Actions` 页面选择 `Docker Image Sync to Aliyun`，点击 `Run workflow` 手动运行。
+
+同步结果会显示在 Actions 日志中，也会通过 Resend 发送邮件。任何镜像同步失败都会使 Job 标记为失败；邮件主题会区分成功、部分失败、全部失败和无新镜像四种情况。
+
+### 工作流执行顺序
+
+1. 检出仓库并安装 `skopeo`、AWS CLI。
+2. 登录阿里云目标 Registry；目标端登录失败会立即终止同步。
+3. 按 `images.txt` 逐行检查源镜像，必要时先登录对应的私有 Registry。
+4. 比较源端和目标端摘要；一致的镜像跳过，不一致的镜像执行复制和重试。
+5. 输出目标端清单形态，写入同步统计，并发送邮件报告。
+
+其中源镜像认证失败只会影响对应镜像；目标 Registry 认证失败会使整个 Job 失败。工作流使用并发组避免两个同步任务同时推送同一批 tag。带 attestation 的镜像会先写入临时 tag，只有完整 manifest list 推送成功后才更新正式 tag。
+
+## 镜像名称映射
+
+阿里云目标镜像引用使用以下规则生成：
+
+- 没有 `/` 的 Docker Hub 镜像会增加 `library_` 前缀；
+- 其他镜像引用中的 `/` 会替换为 `_`；
+- 原始 tag 会保留；
+- 源镜像使用 digest 引用时，digest 只用于源端的精确检查和复制，不会拼接到目标镜像名称中；目标端未显式指定 tag 时使用默认的 `latest` tag。
+
+| `images.txt` 中的源镜像 | 阿里云目标镜像 |
 |---|---|
-| `python:3.13-slim` | `your-registry.example.com/my-namespace/library_python:3.13-slim` |
-| `bitnami/redis:7` | `your-registry.example.com/my-namespace/bitnami_redis:7` |
-| `sengokucola/maibot:latest` | `your-registry.example.com/my-namespace/sengokucola_maibot:latest` |
-| `ghcr.io/owner/repo:tag` | `your-registry.example.com/my-namespace/ghcr.io_owner_repo:tag` |
+| `nginx:latest` | `registry.example.com/namespace/library_nginx:latest` |
+| `bitnami/redis:7` | `registry.example.com/namespace/bitnami_redis:7` |
+| `ghcr.io/owner/repo:tag` | `registry.example.com/namespace/ghcr.io_owner_repo:tag` |
+| `mcr.microsoft.com/dotnet/aspnet:8.0` | `registry.example.com/namespace/mcr.microsoft.com_dotnet_aspnet:8.0` |
+| `ubuntu@sha256:<digest>` | `registry.example.com/namespace/library_ubuntu:latest` |
 
-### 4.3 直接拉取阿里云镜像
+其中 `registry.example.com` 对应 `ALIYUN_REGISTRY`，`namespace` 对应 `ALIYUN_NAME_SPACE`。
 
-```bash
-# 1. 登录阿里云容器镜像服务
-docker login --username=yourusername your-registry.example.com
+`images.txt` 支持使用源镜像 digest。工作流会使用完整的 `源镜像@digest` 引用执行检查和复制，因此只要 digest 存在、源 Registry 凭据正确且镜像格式受支持，使用 digest 本身不会导致同步失败。需要注意的是，digest 不会成为目标 tag；例如 `ubuntu@sha256:<digest>` 会写入 `library_ubuntu:latest`。因此不要在 `images.txt` 中同时配置同一源仓库的多个 digest，否则它们会竞争写入同一个目标 tag，后执行的同步可能覆盖先执行的结果。
 
-# 2. 拉取同步的镜像（把 images.txt 中的路径中的 / 替换为 _）
-docker pull your-registry.example.com/my-namespace/library_nginx:latest        # nginx:latest
-docker pull your-registry.example.com/my-namespace/bitnami_redis:7              # bitnami/redis:7
-docker pull your-registry.example.com/my-namespace/ghcr.io_owner_repo:tag       # ghcr.io/owner/repo:tag
-```
-
-绝大多数镜像在多架构同步后仍是完整的 manifest list，`docker pull` 会按当前机器架构自动选平台，**不需要任何额外参数**。
-仅当该镜像走了「逐平台复制」且索引重建失败时（见 Q8），才需要按下文 4.4 的 Q10 处理。
-
-### 4.4 常见问题
-
-**Q1: 为什么拉取同步的镜像需要登录阿里云？**
-
-**A:** 因为阿里云容器镜像服务需要认证才能访问。你需要使用阿里云的账号信息进行登录。
-
-**Q2: 如何获取阿里云的登录凭证？**
-
-**A:** 可以使用以下方式：
-- 阿里云账号的用户名和密码
-- RAM 子账号的 AccessKey ID 和 AccessKey Secret
-- 临时访问凭证
-
-**Q3: 拉取镜像时出现 "unauthorized" 错误怎么办？**
-
-**A:** 检查以下几点：
-1. 确认阿里云 Registry 地址是否正确
-2. 确认用户名和密码是否正确
-3. 确认命名空间是否正确
-4. 确认镜像名称是否正确（注意 `/` 需替换为 `_`）
-
-**Q4: 如何验证镜像是否已成功同步？**
-
-**A:** 使用以下命令检查：
-```bash
-# 检查镜像标签
-docker images | grep my-namespace
-
-# 或使用 skopeo
-skopeo inspect docker://your-registry.example.com/my-namespace/bitnami_redis:7
-```
-
-**Q4.1: 如何确认目标端是多架构清单还是单架构？**
-
-**A:** 看 `manifests` 字段：
+## 拉取同步镜像
 
 ```bash
-skopeo inspect --raw docker://your-registry.example.com/my-namespace/sengokucola_maibot:latest | jq '.mediaType, (.manifests[]? | "\(.platform.os)/\(.platform.architecture): \(.digest)")'
+docker login registry.example.com
+docker pull registry.example.com/namespace/library_nginx:latest
+docker pull registry.example.com/namespace/bitnami_redis:7
 ```
 
-- 输出 `manifest.list.v2+json` 或 `image.index.v1+json` + 多条平台记录 → 多架构，直接 `docker pull` 即可
-- 输出 `manifest.v2+json` / `image.manifest.v1+json`（没有 `manifests` 字段）→ 单架构，按下文 Q10 处理
-
-
-**Q5: 如何同步和拉取私有镜像？**
-
-**A:** 私有镜像需要额外的认证信息：
-
-1. **Docker Hub 私有镜像**：
-   - 在 GitHub Secrets 中配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_PASSWORD`
-   - 在 `images.txt` 中添加私有镜像，如 `your-username/private-image:tag`
-
-2. **GitHub Container Registry (ghcr.io) 私有镜像**：
-   - 在 GitHub Secrets 中配置 `GITHUB_TOKEN`（Personal Access Token）
-   - 在 `images.txt` 中添加私有镜像，如 `ghcr.io/your-org/private-repo:tag`
-
-3. **Google Container Registry (gcr.io) 私有镜像**：
-   - 在 GitHub Secrets 中配置 `GCP_SERVICE_ACCOUNT_KEY`（项目 ID 已包含在 Key 中）
-   - 在 `images.txt` 中添加私有镜像，如 `gcr.io/your-project/private-image:tag`
-
-4. **Azure Container Registry (ACR / *.azurecr.io) 私有镜像**：
-   - 在 GitHub Secrets 中配置 `AZURE_CLIENT_ID`、`AZURE_CLIENT_SECRET`、`AZURE_TENANT_ID`、`AZURE_REGISTRY_NAME`
-   - 在 `images.txt` 中添加镜像，如 `myacr.azurecr.io/your-app:tag`
-   - 注意: `mcr.microsoft.com` 是微软公开注册表，拉取无需认证，放公开区即可
-
-5. **Amazon ECR 私有镜像**：
-   - 在 GitHub Secrets 中配置 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_REGION`
-   - 在 `images.txt` 中添加私有镜像，如 `123456789.dkr.ecr.us-east-1.amazonaws.com/your-app:latest`
-
-**Q6: 工作流如何处理私有镜像的认证？**
-
-**A:** GitHub Actions 工作流会在拉取私有镜像前自动使用相应的认证信息：
-
-- Docker Hub：使用 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_PASSWORD`
-- GitHub Container Registry：使用 `GITHUB_TOKEN`
-- Google Container Registry：使用 `GCP_SERVICE_ACCOUNT_KEY`
-- Azure Container Registry (ACR)：使用 Azure 服务主体
-- Amazon ECR：使用 AWS 凭证
-
-**Q7: 私有镜像同步失败怎么办？**
-
-**A:** 检查以下几点：
-1. 确认私有镜像的认证信息是否正确配置在 GitHub Secrets 中
-2. 确认私有镜像的访问权限是否正确（如 GitHub Token 是否有足够的权限）
-3. 检查 GitHub Actions 日志中的具体错误信息
-4. 确认私有镜像是否存在且可访问
-
-**Q8: 报错 `denied: unknown manifest class for application/vnd.oci.empty.v1+json` 怎么办？**
-
-**A:** 这不是认证问题，而是**阿里云 ACR 拒绝 OCI attestation 清单**。
-
-- **原因**：上游镜像用 `docker buildx build` 构建时默认会附带 provenance / SBOM 证明清单（attestation manifest），
-  它的特征就是 config 为 `application/vnd.oci.empty.v1+json`（空描述符）。
-  阿里云 ACR 个人版的制品类型白名单里没有这一类，于是在**清单上传阶段**直接拒绝，
-  报错里能看到 `denied:` 但后面跟的是 manifest class，而不是权限描述。
-- **典型现象**：日志里 `Copying N images generated from N images in list`，
-  卡在 `copying image 2/4 from manifest list`——第 1 个真实平台推成功了，
-  第 2 个是 attestation 清单被拒。凡是「平台数 × 2」的镜像都属于这一类。
-- **本工作流的处理**：`copy_image()` 分两步降级：
-  1. 原样整份复制，失败后……
-  2. 先尝试 `skopeo copy --multi-arch <平台列表>` 做**多架构重建**：只复制列出的平台，
-     attestation 子清单天然被排除，产出的是完整（非 sparse）manifest list——
-     这是「多架构 + 不含空描述符」的正解；
-     该选项需要较新的 skopeo，**在 ubuntu-latest 自带的 1.13.3 上不可用**，
-     会打印一行「当前 skopeo 不支持平台列表」后继续降级；
-  3. 兜底：**逐平台复制**（`--override-os/--override-arch`），
-     目标端每个制品都是普通单架构 manifest，从根上绕开空描述符。
-- **结果**：
-  - 多架构重建成功 → 目标端仍是完整多架构清单，`docker pull` 行为与普通镜像完全一致；
-  - 落到逐平台兜底 → 目标端是**单架构 tag**（tag 指向最后一个被推送的平台，
-    实测为 arm64），其余平台按 digest 并存，按 Q10 处理。
-  - 实测当前环境（skopeo 1.13.3）走的是兜底路径：`python:3.13-slim`、
-    `mcr.microsoft.com/devcontainers/python:1-3.13-bookworm` 保持多架构（16 / 4 个平台），
-    而 maibot 三个 tag 与 `napcat-docker:latest` 为单架构。
-- **为什么没有直接升级 skopeo**：`containers/skopeo` 的 GitHub release 只有源码、
-  没有预编译二进制；从 `quay.io/skopeo/stable` 官方镜像里 copy 出的二进制依赖
-  Debian 的 `libsubid.so.5`，在 Ubuntu runner 上补装该库后仍无法运行。
-  保留一个随时可能把同步搞挂的安装步骤不划算，因此接受该限制。
-  如果将来需要多架构，可在 `images.txt` 里改用上游已去掉 attestation 的镜像，
-  或自行用 buildx 以 `provenance: false, sbom: false` 重新构建。
-- **上游根治**：如果是你自己的镜像，构建时加 `provenance: false, sbom: false`（buildx），
-  例如 `docker/build-push-action@v6` 的 `with:` 里加上这两项。
-- **为什么以前能成功、后来突然失败**：阿里云侧的制品类型准入规则会变，
-  而上游镜像也在持续重建。同一个 tag 的内容从「普通 manifest list」变成
-  「带 attestation 的 OCI index」后，失败会立刻开始，且**每个 cron 周期重复一次**。
-
-**Q9: 为什么邮箱里收到的主题和实际结果对不上？**
-
-**A:** 旧版工作流用 `${{ env.FAILURE_COUNT > 0 && ... }}` 判断主题，但这些计数只写进了
-`$GITHUB_ENV`，在 workflow 解析期的 `env` 上下文里并不存在，恒为空，导致主题不可信。
-现已改为在邮件步骤通过 `env:` 读取计数、再在 shell 内用 `$FAILURE_COUNT` 判断，
-主题分为四种：`✅ 成功` / `⚠️ 部分失败` / `❌ 失败` / `☕ 无新镜像`。
-
-**Q10: 目标端是单架构 tag，arm64 机器拉不到镜像怎么办？**
-
-**A:** 这表示该镜像走了逐平台兜底路径（多架构重建在当前 skopeo 版本下不可用）。
-先按 Q4.1 确认目标端形态，再按需处理：
+对于源端本身包含多个平台的镜像，无论是否带 attestation，成功同步后正式 tag 都会发布为 manifest list/index。Docker 会根据当前平台自动选择对应镜像，因此 amd64、arm64 等平台使用完全相同的拉取命令，不需要手动指定平台或 digest。
 
 ```bash
-# 1. 查看目标端有哪些平台及其 digest
-skopeo inspect --raw docker://your-registry.example.com/my-namespace/sengokucola_maibot:latest \
-  | jq '.manifests[]? | {os: .platform.os, arch: .platform.architecture, digest}'
-
-# 2. 按 digest 拉取指定平台（最稳，跨平台都适用）
-docker pull your-registry.example.com/my-namespace/sengokucola_maibot@sha256:<digest>
-
-# 3. 或直接声明平台（本机为 arm64 时配合 QEMU 也可用）
-docker pull --platform linux/arm64 your-registry.example.com/my-namespace/sengokucola_maibot:latest
+docker pull registry.example.com/namespace/bitnami_redis:7
 ```
 
-在 `docker-compose.yml` / K8s manifest 里可以写成 digest 形式：
+如果多平台源镜像无法重建完整的多架构清单，工作流会报告失败并保留原正式 tag，不会发布一个只适用于单个平台的新 tag。源端本身只有一个平台的镜像仍然只能在该平台运行，工具不会替它生成不存在的架构。
+
+在 Docker Compose 中使用目标端地址：
 
 ```yaml
 services:
   app:
-    image: your-registry.example.com/my-namespace/sengokucola_maibot@sha256:<arm64-digest>
+    image: registry.example.com/namespace/bitnami_redis:7
 ```
 
-注意：digest 方式不会随上游更新自动跟进，更换版本时需要重新查一次 digest。
+### jq 是什么？
 
+`jq` 是 GitHub Actions Runner 上使用的 JSON 处理工具。这个 workflow 用它读取 OCI/Docker manifest，过滤 buildx attestation，提取 `os`、`architecture`、`variant` 和 digest，并比较源端与目标端是否一致。
 
----
+它是同步实现的内部依赖，不是镜像运行时依赖。普通使用者不需要在 `docker pull` 时安装或执行 `jq`；只有在本地运行 fixture 验证脚本时才需要准备 jq。
 
-## 安全注意事项
+## Secrets 与私有 Registry
 
-- **敏感信息**：所有敏感信息（如密码、API Key）都应通过 GitHub Secrets 管理
-- **权限控制**：确保只有授权用户可以访问阿里云容器镜像服务
-- **镜像安全**：定期扫描镜像漏洞，确保使用安全的镜像版本
+公开镜像无需额外认证。以下 Secrets 只在 `images.txt` 包含对应 Registry 的私有镜像时配置。
 
-## 支持的镜像注册表
+### Docker Hub
 
-| 注册表 | 支持的私有镜像 | 认证方式 |
-|--------|--------------|----------|
-| Docker Hub | ✅ | 用户名/密码 |
-| GitHub Container Registry (ghcr.io) | ✅ | Personal Access Token |
-| Google Container Registry (gcr.io) | ✅ | 服务账号密钥 |
-| Microsoft Container Registry (mcr.microsoft.com) | ❌ 仅公开 | 无需认证 |
-| Azure Container Registry (*.azurecr.io) | ✅ | Azure 服务主体 |
-| Quay.io | ❌ 仅公开 | 无需认证 |
-| Amazon ECR | ✅ | AWS 访问密钥 |
+| Secret | 说明 |
+|---|---|
+| `DOCKERHUB_USERNAME` | Docker Hub 用户名 |
+| `DOCKERHUB_PASSWORD` | 密码或 Access Token |
 
----
+### GitHub Container Registry
 
-## 五、常见问题
+当前 workflow 中的 `GITHUB_TOKEN` 是 GitHub Actions 自动提供的工作流 Token，不需要也不应手动创建同名 Secret。它可用于读取当前仓库或当前工作流有权限访问的 GHCR 包，另外还需要目标包本身授予该仓库访问权限。
 
-### Q1: 为什么拉取某些镜像需要认证？
+如果要访问其他组织或账号下的私有 GHCR 镜像，当前 workflow 没有独立的 PAT 配置入口。应先将 workflow 改为使用专用的 `GHCR_TOKEN` 和 `GHCR_USERNAME` Secrets，再配置一个具有 `read:packages` 权限且已获目标包授权的 PAT；不要假设创建名为 `GITHUB_TOKEN` 的 Secret 就能覆盖 GitHub 自动注入的 Token。
 
-**A:** 公开镜像可以直接拉取，但私有镜像需要提供认证信息。GitHub Actions 工作流在拉取镜像时，如果遇到私有镜像，需要确保：
-- Docker Hub 私有镜像：在 GitHub Secrets 中配置 Docker Hub 凭证
-- ghcr.io 私有镜像：配置 GitHub Token
-- gcr.io 私有镜像：配置 Google Cloud 凭证
-- ACR (*.azurecr.io) 私有镜像：配置 Azure 服务主体
+### Google Container Registry
 
-### Q2: 如何验证镜像是否已同步到阿里云？
+| Secret | 说明 |
+|---|---|
+| `GCP_SERVICE_ACCOUNT_KEY` | GCP 服务账号 JSON Key，需具备目标镜像的读取权限 |
 
-**A:** 使用 `skopeo` 或 `docker` 命令检查：
+### Azure Container Registry
+
+| Secret | 说明 |
+|---|---|
+| `AZURE_CLIENT_ID` | 服务主体 Client ID |
+| `AZURE_CLIENT_SECRET` | 服务主体 Secret |
+| `AZURE_TENANT_ID` | Azure 租户 ID |
+| `AZURE_REGISTRY_NAME` | ACR 名称，不含 `.azurecr.io` |
+
+`mcr.microsoft.com` 是公开 Registry，不需要 Azure Secret。私有 ACR 登录依赖 GitHub-hosted Ubuntu Runner 中可用的 Azure CLI。
+
+### Amazon ECR
+
+| Secret | 说明 |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | AWS Access Key ID |
+| `AWS_SECRET_ACCESS_KEY` | AWS Secret Access Key |
+| `AWS_REGION` | ECR 所在区域，例如 `us-east-1` |
+
+工作流会在第一次读取 ECR 源镜像清单之前执行 `aws ecr get-login-password` 登录。建议使用只读权限最小化的 IAM 用户或角色。
+
+## 阿里云配置
+
+1. 登录[阿里云容器镜像服务控制台](https://cr.console.aliyun.com/)并确认 Registry 地址。
+2. 创建命名空间，并将其名称填入 `ALIYUN_NAME_SPACE`。
+3. 创建具备目标仓库推送和读取权限的 RAM 凭证。
+4. 将 Registry 地址、命名空间、用户名和密码写入 GitHub Secrets。
+
+建议使用 RAM 子账号或专用访问凭证，不要把密码直接写进 `images.txt`、workflow 或邮件内容。
+
+## Resend 邮件通知
+
+1. 在 [Resend](https://resend.com/) 创建 API Key。
+2. 验证一个发件人域名或邮箱。
+3. 配置 `RESEND_API_KEY`、`RESEND_SENDER_EMAIL` 和 `EMAIL_RECIPIENT`。
+
+邮件报告包含成功、跳过、失败数量、逐镜像结果以及 GitHub Actions 运行链接。邮件发送失败只会在日志中告警，不会改变同步步骤的成功或失败状态。
+
+## Attestation 与多架构行为
+
+### Q1：为什么完整复制会报 `unknown manifest class for application/vnd.oci.empty.v1+json`？
+
+这是上游镜像的 provenance 或 SBOM attestation 清单被阿里云 Registry 拒绝，不是普通的登录失败。buildx 生成的 attestation 常使用 `application/vnd.oci.empty.v1+json` 作为 config，部分阿里云 ACR 实例不接受这类制品。
+
+### Q2：工作流如何处理这类镜像？
+
+`copy_image()` 使用两级策略：
+
+1. 先使用 `skopeo copy --all` 尝试原样复制，以保留普通镜像的完整多架构清单；
+2. 失败后过滤 `unknown` 平台和 attestation 子清单，优先尝试精确平台列表重建；
+3. 如果 Runner 自带的旧版 skopeo 不支持平台列表，则把每个平台复制到唯一临时 tag，再使用 Docker manifest list 重新组装正式 tag；每个平台最多重试 3 次。
+
+只有正式 manifest list 推送成功后才算同步成功。这样最终正式 tag 仍然可以被所有支持的 Docker 平台用同一条 `docker pull` 命令拉取；如果重建失败，本次同步失败，正式 tag 保持原状态。
+
+### Q3：为什么不直接升级 skopeo？
+
+上游 release 没有适用于此 Runner 的稳定预编译二进制。从官方容器镜像复制二进制时还会遇到 Debian 与 Ubuntu 的运行库差异。为了避免升级步骤本身让整个同步任务失效，工作流目前使用系统版本，并保留临时 tag + manifest list 重建路径。
+
+如果是自己构建的镜像，可以在 buildx 中关闭证明清单：
+
+```yaml
+with:
+  provenance: false
+  sbom: false
+```
+
+### Q4：如何确认目标端仍是多架构清单？
 
 ```bash
-# 使用 skopeo 检查
-skopeo inspect docker://your-registry.example.com/my-namespace/bitnami_redis:7
-
-# 或登录阿里云后拉取
-docker login your-registry.example.com
-docker pull your-registry.example.com/my-namespace/bitnami_redis:7
+skopeo inspect --raw docker://registry.example.com/namespace/image:tag \
+  | jq '.mediaType, (.manifests[]? | "\(.platform.os)/\(.platform.architecture): \(.digest)")'
 ```
 
-### Q3: 邮件通知发送失败怎么办？
+输出中应包含 `manifests` 和多个真实平台记录，并且不应出现 `unknown/unknown` 的 attestation 条目。这个命令用于排障，不是日常拉取镜像的必要步骤。
 
-**A:** 检查以下几点：
-1. Resend API Key 是否正确
-2. 发件人邮箱是否已在 Resend 中验证
-3. 检查 GitHub Actions 日志中的错误信息
-4. 确认 Resend 账户有足够的发送额度
+### Q5：为什么同步失败而不是发布单平台 tag？
 
-### Q4: 如何测试工作流配置是否正确？
+项目的目标是让正式 tag 在不同平台上使用同一条拉取命令。逐个平台直接写入同一个 tag 会让后写入的平台覆盖先前平台，因此 workflow 不再接受这种结果。
 
-**A:** 
-1. 在 GitHub 仓库页面，进入 `Actions` 标签
-2. 选择 `Docker Image Sync to Aliyun` 工作流
+当某个平台复制失败、manifest list 创建失败、平台标注失败或最终推送失败时，workflow 会返回失败，并尽量保留旧正式 tag。已经上传的临时 tag 由 Registry 生命周期规则清理，不会被当作正式镜像使用。
 
-3. 点击 `Run workflow` 手动触发
-4. 查看运行日志，检查是否有错误
+### Q6：临时 tag 会不会影响正常使用？
 
-### Q5: 镜像名称映射规则是什么？
+不会。临时 tag 只用于重建期间暂存单个平台，正式 tag 只有在完整 manifest list 推送成功后才更新。临时 tag 使用 workflow run 唯一标识生成，建议在阿里云容器镜像服务中配置生命周期规则定期清理。
 
-**A:** 阿里云 ACR 仓库名不支持多级路径（`/`），因此工作流会将源镜像路径中的 `/` 替换为 `_`：
+## 常见问题
 
-| 源镜像 | 阿里云目标仓库名 |
-|---|---|
-| `nginx:latest` | `library_nginx:latest` |
-| `bitnami/redis:7` | `bitnami_redis:7` |
-| `ghcr.io/owner/repo:tag` | `ghcr.io_owner_repo:tag` |
-| `gcr.io/project/image:tag` | `gcr.io_project_image:tag` |
-| `mcr.microsoft.com/dotnet/aspnet:8.0` | `mcr.microsoft.com_dotnet_aspnet:8.0` |
+### Q7：为什么 GitHub Actions Job 失败但邮件仍然发送？
 
+同步步骤会先把统计结果写入 `$GITHUB_ENV`，再以非零状态结束。状态转储和邮件步骤使用 `if: always()`，因此即使同步失败，也会继续输出目标端状态并发送报告。
+
+### Q8：为什么镜像没有被重新同步？
+
+工作流会比较源端与目标端的内容摘要。多架构镜像比较真实平台的 digest，并忽略 attestation；单架构镜像比较 config digest。摘要一致时日志会显示 `Skip (digest 一致)`。
+
+### Q9：私有镜像出现 `unauthorized` 怎么办？
+
+确认对应 Registry 的 Secret 已配置，Token 或服务账号具有读取权限，并检查日志中的 Registry 地址。ECR 会在源端 `inspect` 之前登录；GHCR 外部私有包需要带 `read:packages` 的 PAT。
+
+### Q10：邮件主题为什么分成四种？
+
+邮件步骤直接读取前一步通过 `$GITHUB_ENV` 写入的 shell 变量：
+
+- 有成功且有失败：部分失败；
+- 只有失败：同步失败；
+- 有成功且无失败：同步成功；
+- 没有成功或失败：无新镜像，通常表示全部跳过。
+
+## 本地验证
+
+本地验证脚本位于 [`tools/validation/README.md`](tools/validation/README.md)，可检查 YAML 结构、jq 清单处理逻辑和提取后的 Shell 脚本。
+
+```bash
+npm install --no-save yaml
+node tools/validation/check.mjs .github/workflows/docker.yaml
+node tools/validation/jqcheck.mjs
+node tools/validation/extract.mjs .github/workflows/docker.yaml ./out
+bash -n ./out/sync.sh
+bash -n ./out/mail.sh
+```
+
+`jqcheck.mjs` 需要本机可用的 `jq`。Windows 下载方式和查找顺序请参阅验证工具文档。`out/` 只用于本地检查，不应提交到仓库。
+
+Windows 推荐在 Git Bash 或 PowerShell 中先安装依赖，再执行检查：
+
+```powershell
+npm install --no-save yaml
+gh release download jq-1.7.1 --repo jqlang/jq --pattern "jq-windows-amd64.exe" --dir tools/validation/bin
+node tools/validation/check.mjs .github/workflows/docker.yaml
+node tools/validation/jqcheck.mjs
+node tools/validation/extract.mjs .github/workflows/docker.yaml ./out
+bash -n ./out/sync.sh
+bash -n ./out/mail.sh
+```
+
+这里的 `gh` 命令来自 GitHub CLI；也可以手动下载 jq，并通过 `JQ` 环境变量指定可执行文件路径。验证脚本只做静态检查和 fixture 测试，不会登录 Registry、拉取镜像或推送镜像。
+
+## 支持范围
+
+| Registry | 公开镜像 | 私有镜像 | 认证方式 |
+|---|---:|---:|---|
+| Docker Hub | ✅ | ✅ | 用户名 + 密码或 Access Token |
+| GitHub Container Registry | ✅ | ✅ | Actions Token 或 `read:packages` PAT |
+| Google Container Registry | ✅ | ✅ | 服务账号 JSON Key |
+| Microsoft Container Registry | ✅ | ❌ | 无需认证 |
+| Azure Container Registry | ✅ | ✅ | Azure 服务主体 |
+| Amazon ECR | ✅ | ✅ | AWS 访问密钥 |
+| 其他公开 OCI Registry | ✅ | 视 Registry 而定 | 工作流不提供通用私有 Registry 凭据入口 |

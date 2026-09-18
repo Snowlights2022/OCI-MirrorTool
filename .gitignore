@@ -5,3 +5,7 @@ tools/validation/bin/
 *.log
 .tmp-check/
 .tmp-validate/
+
+# 本地 Node.js 依赖和提取出的 Shell 脚本
+node_modules/
+out/

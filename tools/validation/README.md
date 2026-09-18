@@ -15,11 +15,15 @@
 ## 运行
 
 ```bash
-npm install yaml            # 仅 check.mjs / extract.mjs 需要
+npm install --no-save yaml  # 仅 check.mjs / extract.mjs 需要，不写入运行时依赖
 node tools/validation/check.mjs .github/workflows/docker.yaml
 node tools/validation/jqcheck.mjs
 node tools/validation/extract.mjs .github/workflows/docker.yaml ./out
+bash -n ./out/sync.sh
+bash -n ./out/mail.sh
 ```
+
+`bash -n` 只检查提取出的 Shell 语法，不会连接 Registry 或推送镜像。Windows 可使用 Git Bash 或 WSL 执行；`out/` 和 `node_modules/` 已加入 `.gitignore`。
 
 `jqcheck.mjs` 需要一个 jq 可执行文件，按以下顺序查找：
 

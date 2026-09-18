@@ -10,6 +10,10 @@ on:
     paths:
       - 'images.txt'
 
+permissions:
+    contents: read
+    packages: read
+
 env:
   ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
@@ -60,27 +64,47 @@ jobs:
           remove-dotnet: 'true'
           remove-haskell: 'true'
           build-mount-path: '/var/lib/docker/'
-
       - name: Restart docker
-        run: sudo service docker restart
+        run: |
+          sudo service docker restart
+      - name: Check container tooling
+        run: |
+          docker manifest --help >/dev/null
+          docker buildx version
+          skopeo --version
 
-      # 说明：这里曾尝试把 skopeo 换成上游新版，以启用 --multi-arch 的“平台列表”
-      # 能力（从而让带 attestation 的镜像也能保持多架构）。结论是这条路不可行：
-      #   - containers/skopeo 的 GitHub release 只有源码，没有预编译二进制；
-      #   - 从官方镜像 copy 出来的二进制依赖 Debian 的 libsubid.so.5，
-      #     在 Ubuntu runner 上即使补装该库也无法运行。
-      # 与其保留一个随时可能把同步搞挂的安装步骤，不如接受系统自带版本的限制：
-      # 带 buildx attestation 的镜像会退化为“单架构 tag”，其余平台按 digest 保留。
-      # 详见 README 的 Q8 / Q10。
+          # 带 buildx attestation 的镜像会在 fallback 中先按平台上传，再重建完整 manifest list。
+          # 详见 README 的 Attestation 与多架构行为章节。
 
       - name: Sync and Push to Aliyun
         id: sync_step
         run: |
+          SYNC_SUMMARY=""
+          SUCCESS_COUNT=0
+          FAILURE_COUNT=0
+          SKIPPED_COUNT=0
+
+          write_result() {
+              {
+                  echo "SUCCESS_COUNT=$SUCCESS_COUNT"
+                  echo "FAILURE_COUNT=$FAILURE_COUNT"
+                  echo "SKIPPED_COUNT=$SKIPPED_COUNT"
+              } >> "$GITHUB_ENV"
+              {
+                  echo 'SYNC_RESULT<<SYNC_RESULT_EOF'
+                  echo -e "$SYNC_SUMMARY"
+                  echo 'SYNC_RESULT_EOF'
+              } >> "$GITHUB_ENV"
+          }
+
           # 阿里云登录是硬依赖：一旦凭证过期/失效，下面每个镜像都会以
-          # "unauthorized / denied" 失败，邮件里就会凭空多出 N 条同步失败。
-          # 这里改为立即失败，让日志和邮件直接指向真正的原因。
+          # "unauthorized / denied" 失败。先写入失败结果，再立即退出，
+          # 让邮件和 Job 状态都直接指向真正的原因。
           if ! echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"; then
               echo ">>> ❌ 阿里云镜像仓库登录失败：请检查 ALIYUN_REGISTRY / ALIYUN_REGISTRY_USER / ALIYUN_REGISTRY_PASSWORD 这三个 Secret"
+              SYNC_SUMMARY="\\n❌ 阿里云镜像仓库登录失败"
+              FAILURE_COUNT=1
+              write_result
               exit 1
           fi
           
@@ -105,11 +129,6 @@ jobs:
               az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" 2>&1 || { echo ">>> ⚠️ Azure 登录失败，跳过"; true; }
               az acr login --name "$AZURE_REGISTRY_NAME" 2>&1 || echo ">>> ⚠️ ACR 登录失败，跳过"
           fi
-
-          SYNC_SUMMARY=""
-          SUCCESS_COUNT=0
-          FAILURE_COUNT=0
-          SKIPPED_COUNT=0
 
           # -------------------------------------------------------------------
           # 摘要比对：忽略 attestation 子清单
@@ -207,8 +226,7 @@ jobs:
           #      "Copy only specific platforms"，只有列出的平台会被推上去，
           #      attestation 子清单天然被排除；产出的是完整（非 sparse）
           #      manifest list —— 既是多架构，又不含 application/vnd.oci.empty.v1+json。
-          #   b) 兜底：逐个平台单独推（`--override-os/--override-arch`），
-          #      tag 最终指向其中一个平台，其余平台按 digest 并存。
+          #   b) 兜底：逐个平台推到临时 tag，再用 Docker manifest list 组装回正式 tag。
           #
           # 为什么不用"改写后的 index 再整份复制"：过滤后的 index 只存在于本地，
           # 其子清单仍在远端 registry，skopeo 无法用本地 oci: 引用去远端取子清单，
@@ -239,7 +257,6 @@ jobs:
               fi
 
               local plat_count=0
-              local available=0
               local plat_list=""
               local os arch variant
               while IFS=' ' read -r os arch variant; do
@@ -277,22 +294,72 @@ jobs:
                       return 0
                   fi
                   echo ">>> ↻ 当前 skopeo 不支持平台列表，最后一行: $(printf '%s' "$rebuild_err" | tail -n 1)"
-                  echo ">>> ⚠️ 回退到逐个平台推送（tag 将指向单个平台，其余平台按 digest 保留）"
+                  echo ">>> ↻ 回退到临时 tag 复制，再重建完整 manifest list"
               fi
 
-              # b) 兜底：逐个平台单独推
+              # b) 兜底：逐个平台推到临时 tag，最后重建正式 manifest list。
+              # 临时 tag 按 run、attempt、目标引用和平台序号隔离；失败时保留，
+              # 交由 Registry 生命周期规则清理，避免用 digest 删除误伤共享 manifest。
+              local target_ref="${dst#docker://}"
+              local target_last_path="${target_ref##*/}"
+              local target_repo="$target_ref"
+              if [[ "$target_last_path" == *:* ]]; then
+                  target_repo="${target_ref%:*}"
+              else
+                  target_ref="${target_ref}:latest"
+              fi
+              local target_key
+              target_key=$(printf '%s' "$target_ref" | sha256sum | cut -c1-12)
+              local temp_refs=()
+              local platform_specs=()
+              local platform_index=0
+
               while IFS=' ' read -r os arch variant; do
                   [ -z "$os" ] && continue
-                  echo ">>> 按平台推送: ${os}/${arch}${variant:+/$variant}"
-                  if ! retry_copy "$src_ref" "$dst" "$dest_creds" 3 \
-                          --override-os "$os" --override-arch "$arch" ${variant:+--override-variant "$variant"}; then
+                  platform_index=$((platform_index + 1))
+                  temp_ref="${target_repo}:mirror-tmp-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${target_key}-${platform_index}"
+                  echo ">>> 按平台推送到临时 tag: ${os}/${arch}${variant:+/$variant}"
+                  local copy_options=(--override-os "$os" --override-arch "$arch")
+                  [ -n "$variant" ] && copy_options+=(--override-variant "$variant")
+                  if ! retry_copy "$src_ref" "docker://${temp_ref}" "$dest_creds" 3 "${copy_options[@]}"; then
                       echo ">>> ✗ 平台 ${os}/${arch} 推送失败"
                       return 1
                   fi
-                  available=$((available + 1))
+                  temp_refs+=("$temp_ref")
+                  platform_specs+=("$os|$arch|$variant")
               done <<< "$plats"
 
-              echo ">>> ⚠️ 目标端为单架构 tag（各平台仍可按 digest 拉取），可用平台数: ${available}"
+              if [ "${#temp_refs[@]}" -eq 0 ]; then
+                  echo ">>> ✗ 没有可用于重建 manifest list 的平台"
+                  return 1
+              fi
+
+              echo ">>> 重建多架构 manifest list: ${target_ref}"
+              docker manifest rm "$target_ref" 2>/dev/null || true
+              if ! docker manifest create "$target_ref" "${temp_refs[@]}"; then
+                  echo ">>> ✗ manifest list 创建失败；正式 tag 未更新"
+                  return 1
+              fi
+
+              local index
+              for index in "${!temp_refs[@]}"; do
+                  IFS='|' read -r os arch variant <<< "${platform_specs[$index]}"
+                  local annotate_options=(--os "$os" --arch "$arch")
+                  [ -n "$variant" ] && annotate_options+=(--variant "$variant")
+                  if ! docker manifest annotate "$target_ref" "${temp_refs[$index]}" "${annotate_options[@]}"; then
+                      echo ">>> ✗ manifest list 平台标注失败；正式 tag 未更新"
+                      docker manifest rm "$target_ref" 2>/dev/null || true
+                      return 1
+                  fi
+              done
+
+              if ! docker manifest push --purge "$target_ref"; then
+                  echo ">>> ✗ manifest list 推送失败；正式 tag 未更新"
+                  docker manifest rm "$target_ref" 2>/dev/null || true
+                  return 1
+              fi
+
+              echo ">>> ✓ 正式 tag 已恢复为多架构 manifest list，可由 Docker 自动选择平台"
               return 0
           }
 
@@ -300,8 +367,8 @@ jobs:
           # 复制策略：
           #   1) 原样整份复制（单次尝试，快速失败）—— 不含 attestation 的镜像走这里，
           #      保留完整的 manifest list。
-          #   2) 逐平台复制 + 索引重建（每平台带 3 次重试）—— 源 index 里含 buildx
-          #      attestation 时触发，因为阿里云 ACR 拒绝 application/vnd.oci.empty.v1+json。
+          #   2) 逐平台复制 + manifest list 重建（每平台带 3 次重试）—— 源 index 里含
+          #      buildx attestation 时触发，因为阿里云 ACR 拒绝 application/vnd.oci.empty.v1+json。
           #   策略 1 只试一次是有意的：对 attestation 镜像重试 3 次纯属浪费
           #   （每次失败都要走完一遍 manifest 上传），真正的瞬时抖动由逐平台的重试兜住。
           # -------------------------------------------------------------------
@@ -324,7 +391,7 @@ jobs:
               fi
 
               if [ "${real_plats:-0}" -gt 0 ]; then
-                  echo ">>> 策略 2/2: 逐平台复制（${real_plats} 个平台，剔除 attestation 子清单）"
+                  echo ">>> 策略 2/2: 逐平台复制并重建 manifest list（${real_plats} 个平台，剔除 attestation 子清单）"
                   if copy_per_platform "$filtered" "$src_ref" "$dst" "$dest_creds"; then
                       return 0
                   fi
@@ -361,6 +428,16 @@ jobs:
               fi
               target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$repo_name"
 
+              # 对需要认证的源 registry 做 docker login（skopeo 会读取 ~/.docker/config.json）。
+              # 必须在第一次 inspect 前完成，否则私有 ECR 的源摘要会被误判为空。
+              # Amazon ECR
+              if [[ "$full_image" == *"dkr.ecr."*".amazonaws.com"* ]] && [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ] && [ -n "${AWS_REGION}" ]; then
+                  ecr_registry=$(echo "$full_image" | cut -d'/' -f1)
+                  if ! aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ecr_registry" 2>/dev/null; then
+                      echo ">>> ⚠️ ECR 登录失败，继续尝试同步：$ecr_registry"
+                  fi
+              fi
+
               # 比较源和目标是否一致，避免重复同步浮动 tag
               # 多架构: 比较各平台 image digest（忽略 attestation）；单架构: 比较 config digest
               raw=$(skopeo inspect --raw "docker://$src_ref" 2>/dev/null || echo "")
@@ -368,13 +445,6 @@ jobs:
                   echo ">>> Skip (digest 一致): $full_image"
                   SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
                   continue
-              fi
-
-              # 对需要认证的源 registry 做 docker login（skopeo 会读取 ~/.docker/config.json）
-              # Amazon ECR
-              if [[ "$full_image" == *"dkr.ecr."*".amazonaws.com"* ]] && [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ] && [ -n "${AWS_REGION}" ]; then
-                  ecr_registry=$(echo "$full_image" | cut -d'/' -f1)
-                  aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ecr_registry" 2>/dev/null
               fi
 
               # 使用 skopeo copy 直接在两个 registry 间复制（保留所有平台，不占本地磁盘）
@@ -388,17 +458,11 @@ jobs:
               fi
           done < images.txt
 
-          # 写入环境变量供后续步骤使用
-          {
-            echo "SUCCESS_COUNT=$SUCCESS_COUNT"
-            echo "FAILURE_COUNT=$FAILURE_COUNT"
-            echo "SKIPPED_COUNT=$SKIPPED_COUNT"
-          } >> "$GITHUB_ENV"
-          {
-            echo 'SYNC_RESULT<<SYNC_RESULT_EOF'
-            echo -e "$SYNC_SUMMARY"
-            echo 'SYNC_RESULT_EOF'
-          } >> "$GITHUB_ENV"
+          write_result
+          if [ "$FAILURE_COUNT" -gt 0 ]; then
+              echo ">>> ❌ 本轮有 ${FAILURE_COUNT} 个镜像同步失败"
+              exit 1
+          fi
 
       # 只读状态转储：把阿里云上每个目标 tag 的实际形态打印到日志，
       # 便于确认"多架构清单 / 单架构"而不用去猜。失败不影响同步结果。
@@ -437,16 +501,9 @@ jobs:
 
       - name: 发送 Email 通知
         if: always()
-        env:
-          SUCCESS_COUNT: ${{ env.SUCCESS_COUNT }}
-          SKIPPED_COUNT: ${{ env.SKIPPED_COUNT }}
-          FAILURE_COUNT: ${{ env.FAILURE_COUNT }}
-          SYNC_RESULT: ${{ env.SYNC_RESULT }}
         run: |
-          # 注意：这里必须用 shell 变量（$VAR），不能用 ${{ env.VAR }}。
-          # 前者在运行时展开，能看到本步骤 env: 从 GITHUB_ENV 取到的真实计数；
-          # 后者在 workflow 解析期展开，此时 env 上下文里根本没有这些键（恒为空），
-          # 原来的 `env.FAILURE_COUNT > 0` 因此永远为假，主题恒不可信。
+          # GITHUB_ENV 会在步骤之间注入运行时变量，这里直接读取 shell 变量，
+          # 不要用 workflow 解析期的 ${{ env.* }} 覆盖它们。
           SUCCESS_COUNT="${SUCCESS_COUNT:-0}"
           SKIPPED_COUNT="${SKIPPED_COUNT:-0}"
           FAILURE_COUNT="${FAILURE_COUNT:-0}"

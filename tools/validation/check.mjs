@@ -22,6 +22,7 @@ steps.forEach((s, i) => {
 });
 
 const mail = steps.find((s) => (s.name ?? "").includes("Email"));
+const toolingCheck = steps.find((s) => (s.name ?? "").includes("Check container tooling"));
 
 console.log("\n== EMAIL STEP ==");
 console.log("env:", JSON.stringify(mail.env, null, 2));
@@ -168,6 +169,18 @@ const retryCopyBody = codeLines.slice(
 ).join("\n");
 const perPlatformCall = logicalLines.find((l) => l.includes("--override-os")) ?? "";
 const strategy1Call = logicalLines.find((l) => l.includes('"$dest_creds" 1')) ?? "";
+const copyPerPlatformStart = syncRun.indexOf("copy_per_platform() {");
+const copyPerPlatformEnd = syncRun.indexOf("\n          }\n\n          # -------------------------------------------------------------------\n          # 复制策略", copyPerPlatformStart);
+const copyPerPlatformBody = syncRun.slice(copyPerPlatformStart, copyPerPlatformEnd);
+const tempCopyIndex = copyPerPlatformBody.indexOf('retry_copy "$src_ref" "docker://${temp_ref}"');
+const manifestCreateIndex = copyPerPlatformBody.indexOf('docker manifest create "$target_ref"');
+const manifestAnnotateIndex = copyPerPlatformBody.indexOf('docker manifest annotate "$target_ref"');
+const manifestPushIndex = copyPerPlatformBody.indexOf('docker manifest push --purge "$target_ref"');
+const manifestFailureIndex = copyPerPlatformBody.indexOf('manifest list 推送失败');
+const ecrLoginIndex = syncRun.indexOf("aws ecr get-login-password");
+const sourceInspectIndex = syncRun.indexOf('skopeo inspect --raw "docker://$src_ref"');
+const syncResultWriteIndex = syncRun.indexOf("write_result");
+const syncFailureExitIndex = syncRun.indexOf('if [ "$FAILURE_COUNT" -gt 0 ]; then');
 
 const checks = [
   ["sync 步骤包含 platform_fingerprint", syncRun.includes("platform_fingerprint()")],
@@ -181,8 +194,19 @@ const checks = [
   ["retry_copy 不再写死 --all（改由调用方传入）", !/skopeo copy --all "docker:\/\/\$src"/.test(retryCopyBody)],
   ["逐平台复制不带 --all（否则 override 被忽略）", perPlatformCall.includes("--override-os") && !perPlatformCall.includes("--all")],
   ["策略 1 的整份复制仍带 --all", strategy1Call.includes("--all")],
+  ["逐平台复制使用临时 tag", tempCopyIndex >= 0 && copyPerPlatformBody.includes("temp_ref=\"${target_repo}:mirror-tmp-")],
+  ["临时 tag 包含 run、attempt 和平台序号", /mirror-tmp-\$\{GITHUB_RUN_ID:-local\}-\$\{GITHUB_RUN_ATTEMPT:-1\}-\$\{target_key\}-\$\{platform_index\}/.test(copyPerPlatformBody)],
+  ["先完成平台复制再创建 manifest list", tempCopyIndex >= 0 && manifestCreateIndex > tempCopyIndex],
+  ["manifest list 依次执行 create、annotate、push", manifestCreateIndex >= 0 && manifestAnnotateIndex > manifestCreateIndex && manifestPushIndex > manifestAnnotateIndex],
+  ["manifest push 使用 --purge", manifestPushIndex >= 0],
+  ["manifest push 失败会返回非零", manifestFailureIndex >= 0 && copyPerPlatformBody.includes("return 1", manifestFailureIndex)],
+  ["没有使用危险的通用 skopeo delete", !copyPerPlatformBody.includes("skopeo delete")],
+  ["workflow 预检 Docker manifest、buildx 和 skopeo", !!toolingCheck?.run && toolingCheck.run.includes("docker manifest --help") && toolingCheck.run.includes("docker buildx version") && toolingCheck.run.includes("skopeo --version")],
   ["index-only 重建不带 --all", syncRun.includes("--multi-arch index-only") && !syncRun.includes("--all --multi-arch index-only")],
-  ["阿里云登录失败即退出", /if ! echo "\$ALIYUN_REGISTRY_PASSWORD"[\s\S]{0,260}?exit 1/.test(syncRun)],
+  ["阿里云登录失败即退出", /if ! echo "\$ALIYUN_REGISTRY_PASSWORD"[\s\S]*?FAILURE_COUNT=1[\s\S]*?write_result[\s\S]*?exit 1/.test(syncRun)],
+  ["ECR 登录发生在源 inspect 之前", ecrLoginIndex >= 0 && sourceInspectIndex > ecrLoginIndex],
+  ["同步失败会在写入结果后退出", syncFailureExitIndex > syncResultWriteIndex && /exit 1/.test(syncRun.slice(syncFailureExitIndex, syncFailureExitIndex + 180))],
+  ["workflow 声明只读权限", doc.permissions?.contents === "read" && doc.permissions?.packages === "read"],
   ["job 有 timeout-minutes", typeof doc.jobs.build["timeout-minutes"] === "number"],
   ["job 有 concurrency", !!doc.jobs.build.concurrency?.group],
   ["GITHUB_ENV heredoc 使用唯一分隔符", syncRun.includes("SYNC_RESULT<<SYNC_RESULT_EOF")],
