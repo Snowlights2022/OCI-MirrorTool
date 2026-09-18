@@ -64,41 +64,14 @@ jobs:
       - name: Restart docker
         run: sudo service docker restart
 
-      # ubuntu-latest 自带的 skopeo 是 1.13.3，有两个硬伤，导致带 buildx attestation
-      # 的多架构镜像只能退化成"单架构 tag"：
-      #   1) --multi-arch 只接受 system/all/index-only，没有平台列表选项；
-      #   2) 遇到 attestation 清单直接报 unsupported image-specific operation on
-      #      artifact with type application/vnd.docker.attestation.manifest.v1+json，
-      #      连 --all --format v2s2 也走不通。
-      # containers/skopeo 的 release 里没有预编译二进制（只有源码），所以从官方镜像
-      # 里取二进制。必须放在 maximize-build-space 与 docker 重启之后，否则会被
-      # 重新挂载的 /var/lib/docker 冲掉。
-      # 整段 continue-on-error：拿不到就沿用系统版本，下面的复制逻辑自带降级路径，
-      # 只是会退化成单架构 tag，不会让同步失败。
-      - name: Install newer skopeo (from official image)
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          # 官方镜像是基于 Debian 的，二进制依赖 libsubid.so.5；
-          # Ubuntu runner 上默认没有这个库，直接 copy 出来会报
-          # "error while loading shared libraries: libsubid.so.5"。
-          sudo apt-get update
-          sudo apt-get install -y libsubid5 || sudo apt-get install -y libsubid4
-          docker pull quay.io/skopeo/stable:latest
-          cid=$(docker create quay.io/skopeo/stable:latest)
-          docker cp "$cid:/usr/bin/skopeo" /tmp/skopeo-new
-          docker rm -f "$cid" > /dev/null
-          sudo install -m 0755 /tmp/skopeo-new /usr/local/bin/skopeo
-          hash -r
-          # 校验：装不上就退出非 0（continue-on-error 会放行），
-          # 绝不能让一个不能运行的 skopeo 覆盖掉系统那个可用的。
-          if ! skopeo --version; then
-              echo ">>> ❌ 新版 skopeo 不可用，回退到系统自带版本"
-              sudo rm -f /usr/local/bin/skopeo
-              hash -r
-              exit 1
-          fi
-          echo ">>> 生效: $(command -v skopeo) -> $(skopeo --version)"
+      # 说明：这里曾尝试把 skopeo 换成上游新版，以启用 --multi-arch 的“平台列表”
+      # 能力（从而让带 attestation 的镜像也能保持多架构）。结论是这条路不可行：
+      #   - containers/skopeo 的 GitHub release 只有源码，没有预编译二进制；
+      #   - 从官方镜像 copy 出来的二进制依赖 Debian 的 libsubid.so.5，
+      #     在 Ubuntu runner 上即使补装该库也无法运行。
+      # 与其保留一个随时可能把同步搞挂的安装步骤，不如接受系统自带版本的限制：
+      # 带 buildx attestation 的镜像会退化为“单架构 tag”，其余平台按 digest 保留。
+      # 详见 README 的 Q8 / Q10。
 
       - name: Sync and Push to Aliyun
         id: sync_step
@@ -283,39 +256,28 @@ jobs:
               # 注意 runner 上的 skopeo 版本可能较老：--strip-removed-platforms 是较新
               # 版本才有的选项（实测 ubuntu-latest 报 unknown flag），--remove-list-signatures
               # 也未必存在。因此按"选项最全 → 逐步退化"依次尝试，避免因版本差异直接失败。
-              # a) 多架构重建，按可靠性依次尝试。
-              #    首选平台列表：--multi-arch <os/arch,...> 只复制列出的平台，
-              #    attestation 子清单天然被排除，产出完整（非 sparse）manifest list，
-              #    这正是"多架构 + 不含空描述符"的正解。该选项需要较新的 skopeo
-              #    （Ubuntu 自带的 1.13.3 不支持，故工作流会先安装上游最新静态版）。
-              #    其余为兼容旧版本的兜底，任一成功即返回。
+              # a) 多架构重建（尽力而为）。
+              #    首选 --multi-arch <平台列表>：只复制列出的平台，attestation 子清单
+              #    天然被排除，产出完整（非 sparse）manifest list —— 这正是
+              #    "多架构 + 不含空描述符"的正解。
+              #    但 ubuntu-latest 自带的 skopeo 1.13.3 不支持平台列表
+              #    （只接受 system/all/index-only），所以这一步会失败，
+              #    然后落到下面的逐个平台推送。升级 skopeo 的路已试过且不可行，
+              #    详见下方步骤区的说明。
+              #    不再尝试 `--all --format v2s2`：实测该版本处理 attestation 时
+              #    会直接报 unsupported image-specific operation on artifact，
+              #    属于必然失败的死路，留着只会刷屏。
               local rebuild_err=""
               if [ "$plat_count" -gt 0 ] && [ -n "$plat_list" ]; then
-                  echo ">>> 多架构重建 a1: --multi-arch ${plat_list}"
+                  echo ">>> 多架构重建: --multi-arch ${plat_list}"
                   if rebuild_err=$(skopeo copy --multi-arch "$plat_list" --strip-removed-platforms \
                           --remove-list-signatures \
                           "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
                       echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
                       return 0
                   fi
-                  echo ">>> ↻ a1 失败，最后一行: $(printf '%s' "$rebuild_err" | tail -n 1)"
-
-                  echo ">>> 多架构重建 a2: --multi-arch ${plat_list}（去掉较新的选项）"
-                  if rebuild_err=$(skopeo copy --multi-arch "$plat_list" \
-                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
-                      echo ">>> ✓ 目标端已恢复为多架构清单（不含 attestation）"
-                      return 0
-                  fi
-                  echo ">>> ↻ a2 失败，最后一行: $(printf '%s' "$rebuild_err" | tail -n 1)"
-
-                  echo ">>> 多架构重建 a3: --all --format v2s2（转 Docker schema2）"
-                  if rebuild_err=$(skopeo copy --all --format v2s2 \
-                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1); then
-                      echo ">>> ✓ 目标端已恢复为多架构清单"
-                      return 0
-                  fi
-                  echo ">>> ↻ a3 失败，最后一行: $(printf '%s' "$rebuild_err" | tail -n 1)"
-                  echo ">>> ⚠️ 多架构重建均不可用，回退到逐个平台推送（tag 将指向单个平台）"
+                  echo ">>> ↻ 当前 skopeo 不支持平台列表，最后一行: $(printf '%s' "$rebuild_err" | tail -n 1)"
+                  echo ">>> ⚠️ 回退到逐个平台推送（tag 将指向单个平台，其余平台按 digest 保留）"
               fi
 
               # b) 兜底：逐个平台单独推
