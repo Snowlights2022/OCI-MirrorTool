@@ -163,7 +163,7 @@ jobs:
               shift 4
               local attempt=1
               while [ "$attempt" -le "$max_attempts" ]; do
-                  if skopeo copy --all "$src" "$dst" --dest-creds "$dest_creds" "$@" 2>&1; then
+                  if skopeo copy --all "docker://$src" "$dst" --dest-creds "$dest_creds" "$@" 2>&1; then
                       return 0
                   fi
                   echo ">>> ↻ 第 ${attempt}/${max_attempts} 次尝试失败"
@@ -243,7 +243,7 @@ jobs:
                   # 这里直接调 skopeo 而不是 retry_copy：retry_copy 写死了 --all，
                   # 而 index-only 必须与 --all 互斥。
                   if skopeo copy --multi-arch index-only \
-                          "$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                          "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
                       echo ">>> ✓ 目标端已恢复为多架构清单"
                   else
                       echo ">>> ⚠️ 索引重建失败：目标端将保持单架构 tag（各平台仍可按 digest 拉取）"

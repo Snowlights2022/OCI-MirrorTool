@@ -139,6 +139,26 @@ console.log("\n  病态输入（全部为 attestation）→ strip 后条目数:"
 // --- structural checks on the workflow file itself ---
 console.log("\n== STRUCTURAL CHECKS ==");
 const syncRun = steps.find((s) => s.id === "sync_step").run;
+// 代码行（剔除注释与 workflow 表达式行），用于断言真实语句而不是注释文字
+const codeLines = syncRun
+  .split("\n")
+  .map((l) => l.trim())
+  .filter((l) => l && !l.startsWith("#"));
+
+// skopeo copy 的源必须带传输前缀 docker://
+// （曾因重构时丢掉前缀，导致每张镜像都报 `unknown transport`，全线失败）
+// 先把续行（以 \ 结尾）拼成逻辑语句，再逐条检查。
+const logicalLines = [];
+for (const line of codeLines) {
+  if (logicalLines.length && logicalLines[logicalLines.length - 1].endsWith("\\")) {
+    logicalLines[logicalLines.length - 1] = logicalLines[logicalLines.length - 1].slice(0, -1).trim() + " " + line;
+  } else {
+    logicalLines.push(line);
+  }
+}
+const skopeoCopies = logicalLines.filter((l) => /\bskopeo copy\b/.test(l));
+const badTransports = skopeoCopies.filter((l) => !l.includes("docker://$"));
+
 const checks = [
   ["sync 步骤包含 platform_fingerprint", syncRun.includes("platform_fingerprint()")],
   ["sync 步骤包含 strip_attestations", syncRun.includes("strip_attestations()")],
@@ -147,6 +167,11 @@ const checks = [
   ["sync 步骤调用 copy_image", syncRun.includes("copy_image \"$src_ref\"")],
   ["sync 步骤不再直接 skopeo copy --all 源镜像", !syncRun.includes("skopeo copy --all \"docker://$full_image\"")],
   ["源 inspect 使用 src_ref", syncRun.includes('skopeo inspect --raw "docker://$src_ref"')],
+  [`每处 skopeo copy 的源都带 docker:// 前缀（共 ${skopeoCopies.length} 处）`, badTransports.length === 0 && skopeoCopies.length >= 2],
+  ["index-only 重建不带 --all", syncRun.includes("--multi-arch index-only") && !syncRun.includes("--all --multi-arch index-only")],
+  ["阿里云登录失败即退出", /if ! echo "\$ALIYUN_REGISTRY_PASSWORD"[\s\S]{0,260}?exit 1/.test(syncRun)],
+  ["job 有 timeout-minutes", typeof doc.jobs.build["timeout-minutes"] === "number"],
+  ["job 有 concurrency", !!doc.jobs.build.concurrency?.group],
   ["GITHUB_ENV heredoc 使用唯一分隔符", syncRun.includes("SYNC_RESULT<<SYNC_RESULT_EOF")],
   ["邮件步骤已移除 printf -v SUBJECT 表达式", !/printf -v SUBJECT '%s' "\$\{\{/.test(mail.run)],
   ["邮件步骤注释里说明了旧写法（仅注释，非代码）", mail.run.split("\n").filter((l) => l.includes("env.FAILURE_COUNT")).every((l) => l.trim().startsWith("#"))],
@@ -154,6 +179,10 @@ const checks = [
   ["邮件步骤使用 shell 计数变量", mail.run.includes('FAILURE_COUNT="${FAILURE_COUNT:-0}"')],
   ["curl 使用 --fail-with-body", mail.run.includes("--fail-with-body")],
 ];
+if (badTransports.length) {
+  console.log("  缺失 docker:// 前缀的 skopeo copy：");
+  badTransports.forEach((l) => console.log(`    ${l}`));
+}
 let bad = 0;
 for (const [name, ok] of checks) {
   if (!ok) bad++;
