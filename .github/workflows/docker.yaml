@@ -79,13 +79,26 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
+          # 官方镜像是基于 Debian 的，二进制依赖 libsubid.so.5；
+          # Ubuntu runner 上默认没有这个库，直接 copy 出来会报
+          # "error while loading shared libraries: libsubid.so.5"。
+          sudo apt-get update
+          sudo apt-get install -y libsubid5 || sudo apt-get install -y libsubid4
           docker pull quay.io/skopeo/stable:latest
           cid=$(docker create quay.io/skopeo/stable:latest)
           docker cp "$cid:/usr/bin/skopeo" /tmp/skopeo-new
           docker rm -f "$cid" > /dev/null
           sudo install -m 0755 /tmp/skopeo-new /usr/local/bin/skopeo
           hash -r
-          echo ">>> $(command -v skopeo) -> $(skopeo --version)"
+          # 校验：装不上就退出非 0（continue-on-error 会放行），
+          # 绝不能让一个不能运行的 skopeo 覆盖掉系统那个可用的。
+          if ! skopeo --version; then
+              echo ">>> ❌ 新版 skopeo 不可用，回退到系统自带版本"
+              sudo rm -f /usr/local/bin/skopeo
+              hash -r
+              exit 1
+          fi
+          echo ">>> 生效: $(command -v skopeo) -> $(skopeo --version)"
 
       - name: Sync and Push to Aliyun
         id: sync_step
