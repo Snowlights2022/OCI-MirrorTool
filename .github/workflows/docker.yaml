@@ -218,7 +218,7 @@ jobs:
                   .manifests[]?
                   | select((.platform.os // "") != "unknown")
                   | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
-                  | "\(.platform.os) \(.platform.architecture) \(.platform.variant // "")"' 2>/dev/null || echo "")
+                  | "\(.platform.os) \(.platform.architecture) \(.platform.variant // "") \(.digest)"' 2>/dev/null || echo "")
 
               if [ -z "$plats" ]; then
                   echo ">>> 未在清单中找到可用平台"
@@ -226,8 +226,9 @@ jobs:
               fi
 
               local plat_count=0
-              local os arch variant
-              while IFS=' ' read -r os arch variant; do
+              local available=0
+              local os arch variant digest dref
+              while IFS=' ' read -r os arch variant digest; do
                   [ -z "$os" ] && continue
                   echo ">>> 按平台推送: ${os}/${arch}${variant:+/$variant}"
                   if ! retry_copy "$src_ref" "$dst" "$dest_creds" 3 \
@@ -236,15 +237,37 @@ jobs:
                       return 1
                   fi
                   plat_count=$((plat_count + 1))
+
+                  # 该平台在目标端的 digest 与源一致（复制不改变内容摘要），
+                  # 因此可以直接用源 digest 组装索引引用。
+                  if [ -n "$digest" ] && [ "$digest" != "null" ]; then
+                      dref="${dst}@${digest}"
+                      echo ">>> 登记平台摘要以便组装索引: ${digest}"
+                      # 把该平台的 manifest 也按 digest 存入目标仓库：
+                      # Aliyun 在 PUT index 时会校验被引用的子 manifest 是否可解析，
+                      # 只按 tag 推过的话会报 "blob unknown to registry"。
+                      # 摘要取自源索引，选择器必须与源子清单完全一致，
+                      # 否则 skopeo 会重新序列化 manifest 而改变摘要。
+                      local da=0
+                      while [ "$da" -lt 3 ]; do
+                          if skopeo copy "docker://$src_ref" "$dref" --dest-creds "$dest_creds" \
+                                  --override-os "$os" --override-arch "$arch" ${variant:+--override-variant "$variant"} > /dev/null 2>&1; then
+                              available=$((available + 1))
+                              break
+                          fi
+                          da=$((da + 1))
+                          sleep 3
+                      done
+                  fi
               done <<< "$plats"
 
-              # 2b) 索引重建：仅在确实推了多个平台时才有意义
+              # 2b) 索引重建：仅在确实推了多个平台、且子 manifest 都可解析时才有意义
               #
               # 依据 skopeo-copy(1)：`--multi-arch index-only` "creates a sparse manifest
               # list, which usually fail unless the referenced per-architecture images are
-              # already present in the destination"。上面的逐平台推送正好满足这个前提。
-              # 这里不带 --all：--all 会把 attestation 子清单也拉进来，前功尽弃。
-              if [ "$plat_count" -gt 1 ]; then
+              # already present in the destination"。上面的逐平台推送 + 按 digest 登记
+              # 正好满足这个前提。这里不带 --all，否则 attestation 子清单又会被卷进来。
+              if [ "$plat_count" -gt 1 ] && [ "$available" -ge "$plat_count" ]; then
                   echo ">>> 索引重建: 组装 ${plat_count} 平台的多架构清单（index-only，不带 attestation）"
                   if skopeo copy --multi-arch index-only \
                           "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
@@ -252,6 +275,8 @@ jobs:
                   else
                       echo ">>> ⚠️ 索引重建失败：目标端将保持单架构 tag（各平台仍可按 digest 拉取）"
                   fi
+              elif [ "$plat_count" -gt 1 ]; then
+                  echo ">>> ⚠️ 目标端未能按 digest 登记全部平台（${available}/${plat_count}），跳过索引重建"
               fi
 
               return 0
