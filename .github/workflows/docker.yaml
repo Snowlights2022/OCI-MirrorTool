@@ -213,6 +213,9 @@ jobs:
               local dst="$3"
               local dest_creds="$4"
 
+              # 输出四列：os / arch / variant / digest。
+              # 注意 variant 可能为空，但 read 会把连续空白折叠，字段不会错位；
+              # 若按 `read -r os arch variant` 只读三列，digest 会被塞进 variant（曾踩过）。
               local plats
               plats=$(echo "$index_json" | jq -r '
                   .manifests[]?
@@ -248,9 +251,13 @@ jobs:
                       # 只按 tag 推过的话会报 "blob unknown to registry"。
                       # 摘要取自源索引，选择器必须与源子清单完全一致，
                       # 否则 skopeo 会重新序列化 manifest 而改变摘要。
+                      # 用 --format v2s2 转成 Docker schema2：一是这是所有 registry
+                      # 都支持的格式，二是让目标端 digest 与源索引里记录的 digest 对齐
+                      # （按 tag 推时 skopeo 可能保留 OCI 媒体类型，导致摘要不同）。
                       local da=0
                       while [ "$da" -lt 3 ]; do
                           if skopeo copy "docker://$src_ref" "$dref" --dest-creds "$dest_creds" \
+                                  --format v2s2 \
                                   --override-os "$os" --override-arch "$arch" ${variant:+--override-variant "$variant"} > /dev/null 2>&1; then
                               available=$((available + 1))
                               break
@@ -385,6 +392,39 @@ jobs:
             echo -e "$SYNC_SUMMARY"
             echo 'SYNC_RESULT_EOF'
           } >> "$GITHUB_ENV"
+
+      # 只读状态转储：把阿里云上每个目标 tag 的实际形态打印到日志，
+      # 便于确认"多架构清单 / 单架构"而不用去猜。失败不影响同步结果。
+      - name: 转储阿里云目标端状态
+        if: always()
+        run: |
+          echo ">>> 阿里云目标端状态（不打印任何凭证）"
+          while IFS= read -r line || [ -n "$line" ]; do
+              [[ -z "$line" ]] || [[ "$line" =~ ^\s*# ]] && continue
+              raw_image=$(echo "$line" | awk '{print $1}')
+              full_image="${raw_image%%@*}"
+              if [[ "$full_image" == *"/"* ]]; then
+                  repo_name="${full_image//\//_}"
+              else
+                  repo_name="library_${full_image}"
+              fi
+              target="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$repo_name"
+              echo "──────── $target"
+              raw=$(skopeo inspect --raw "docker://$target" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" 2>/dev/null || echo "")
+              if [ -z "$raw" ]; then
+                  echo "   (无法读取)"
+                  continue
+              fi
+              mt=$(echo "$raw" | jq -r '.mediaType // "?"' 2>/dev/null)
+              n=$(echo "$raw" | jq -r '.manifests | length' 2>/dev/null || echo 0)
+              echo "   mediaType: $mt"
+              if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+                  echo "   形态: 多架构（$n 个平台）"
+                  echo "$raw" | jq -r '.manifests[]? | "     \(.platform.os)/\(.platform.architecture)\(if .platform.variant then "/" + .platform.variant else "" end): \(.digest)"' 2>/dev/null
+              else
+                  echo "   形态: 单架构（tag 指向单个 manifest）"
+              fi
+          done < images.txt
 
       - name: 发送 Email 通知
         if: always()
