@@ -159,6 +159,16 @@ for (const line of codeLines) {
 const skopeoCopies = logicalLines.filter((l) => /\bskopeo copy\b/.test(l));
 const badTransports = skopeoCopies.filter((l) => !l.includes("docker://$"));
 
+// --all 与 --override-os/--override-arch 互斥（skopeo-copy(1)：--all 会忽略平台选择、
+// 复制整个列表）。逐平台复制若带 --all，就会把 attestation 子清单一起推上去，
+// 重新触发阿里云拒绝，白跑一轮。
+const retryCopyBody = codeLines.slice(
+  codeLines.findIndex((l) => l === "retry_copy() {"),
+  codeLines.findIndex((l) => l === "retry_copy() {") + 20
+).join("\n");
+const perPlatformCall = logicalLines.find((l) => l.includes("--override-os")) ?? "";
+const strategy1Call = logicalLines.find((l) => l.includes('"$dest_creds" 1')) ?? "";
+
 const checks = [
   ["sync 步骤包含 platform_fingerprint", syncRun.includes("platform_fingerprint()")],
   ["sync 步骤包含 strip_attestations", syncRun.includes("strip_attestations()")],
@@ -168,6 +178,9 @@ const checks = [
   ["sync 步骤不再直接 skopeo copy --all 源镜像", !syncRun.includes("skopeo copy --all \"docker://$full_image\"")],
   ["源 inspect 使用 src_ref", syncRun.includes('skopeo inspect --raw "docker://$src_ref"')],
   [`每处 skopeo copy 的源都带 docker:// 前缀（共 ${skopeoCopies.length} 处）`, badTransports.length === 0 && skopeoCopies.length >= 2],
+  ["retry_copy 不再写死 --all（改由调用方传入）", !/skopeo copy --all "docker:\/\/\$src"/.test(retryCopyBody)],
+  ["逐平台复制不带 --all（否则 override 被忽略）", perPlatformCall.includes("--override-os") && !perPlatformCall.includes("--all")],
+  ["策略 1 的整份复制仍带 --all", strategy1Call.includes("--all")],
   ["index-only 重建不带 --all", syncRun.includes("--multi-arch index-only") && !syncRun.includes("--all --multi-arch index-only")],
   ["阿里云登录失败即退出", /if ! echo "\$ALIYUN_REGISTRY_PASSWORD"[\s\S]{0,260}?exit 1/.test(syncRun)],
   ["job 有 timeout-minutes", typeof doc.jobs.build["timeout-minutes"] === "number"],

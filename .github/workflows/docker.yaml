@@ -154,6 +154,13 @@ jobs:
           # -------------------------------------------------------------------
           # 带重试的复制：Docker Hub 侧瞬时抖动（429/5xx/超时）很常见，
           # 失败一次就永久记为"同步失败"会污染邮件可信度。
+          #
+          # 注意 --all 由调用方通过 extra 参数传入，不再写死：
+          # skopeo-copy(1) 明确写着 --all 的语义是"忽略 --override-os/--override-arch，
+          # 复制列表里的全部镜像以及列表本身"。也就是说 --all 与平台选择互斥
+          # —— 逐平台复制时若带 --all，仍然会把 attestation 子清单一并推上去，
+          # 白白重现被阿里云拒绝的原错误（实测日志：override 成 linux/amd64 后
+          # 依然打印 "copying image 2/4 from manifest list"）。
           # -------------------------------------------------------------------
           retry_copy() {
               local src="$1"
@@ -163,7 +170,7 @@ jobs:
               shift 4
               local attempt=1
               while [ "$attempt" -le "$max_attempts" ]; do
-                  if skopeo copy --all "docker://$src" "$dst" --dest-creds "$dest_creds" "$@" 2>&1; then
+                  if skopeo copy "docker://$src" "$dst" --dest-creds "$dest_creds" "$@" 2>&1; then
                       return 0
                   fi
                   echo ">>> ↻ 第 ${attempt}/${max_attempts} 次尝试失败"
@@ -236,12 +243,9 @@ jobs:
               # 依据 skopeo-copy(1)：`--multi-arch index-only` "creates a sparse manifest
               # list, which usually fail unless the referenced per-architecture images are
               # already present in the destination"。上面的逐平台推送正好满足这个前提。
-              # 注意不要和 --all 同用：--all 的语义是"复制列表里的全部镜像以及列表本身"，
-              # 与 index-only 的"只复制索引"冲突。
+              # 这里不带 --all：--all 会把 attestation 子清单也拉进来，前功尽弃。
               if [ "$plat_count" -gt 1 ]; then
                   echo ">>> 索引重建: 组装 ${plat_count} 平台的多架构清单（index-only，不带 attestation）"
-                  # 这里直接调 skopeo 而不是 retry_copy：retry_copy 写死了 --all，
-                  # 而 index-only 必须与 --all 互斥。
                   if skopeo copy --multi-arch index-only \
                           "docker://$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
                       echo ">>> ✓ 目标端已恢复为多架构清单"
@@ -269,7 +273,7 @@ jobs:
               local src_raw="$4"
 
               echo ">>> 策略 1/2: 整份复制（含全部子清单）"
-              if retry_copy "$src_ref" "$dst" "$dest_creds" 1; then
+              if retry_copy "$src_ref" "$dst" "$dest_creds" 1 --all; then
                   return 0
               fi
 
