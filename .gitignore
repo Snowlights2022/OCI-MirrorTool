@@ -1,0 +1,7 @@
+# tools/validation 用的 jq 二进制由使用者按需自取，不入库（约 1MB）
+tools/validation/bin/
+
+# 本地临时/日志
+*.log
+.tmp-check/
+.tmp-validate/

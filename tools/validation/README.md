@@ -28,7 +28,10 @@ node tools/validation/extract.mjs .github/workflows/docker.yaml ./out
 3. `/usr/bin/jq`、`/usr/local/bin/jq`、`/opt/homebrew/bin/jq`
 4. PATH 上的 `jq`
 
-在 Windows 上取一份静态 jq：
+> `tools/validation/bin/` 已在 `.gitignore` 中，二进制不入库。
+> 若本机已有 jq（Linux/macOS 常见），无需任何额外操作。
+
+在 Windows 上取一份静态 jq 放到该目录：
 
 ```powershell
 gh release download jq-1.7.1 --repo jqlang/jq --pattern "jq-windows-amd64.exe" --dir tools/validation/bin
