@@ -192,6 +192,9 @@ docker pull your-registry.example.com/my-namespace/bitnami_redis:7              
 docker pull your-registry.example.com/my-namespace/ghcr.io_owner_repo:tag       # ghcr.io/owner/repo:tag
 ```
 
+绝大多数镜像在多架构同步后仍是完整的 manifest list，`docker pull` 会按当前机器架构自动选平台，**不需要任何额外参数**。
+仅当该镜像走了「逐平台复制」且索引重建失败时（见 Q8），才需要按下文 4.4 的 Q10 处理。
+
 ### 4.4 常见问题
 
 **Q1: 为什么拉取同步的镜像需要登录阿里云？**
@@ -223,6 +226,18 @@ docker images | grep my-namespace
 # 或使用 skopeo
 skopeo inspect docker://your-registry.example.com/my-namespace/bitnami_redis:7
 ```
+
+**Q4.1: 如何确认目标端是多架构清单还是单架构？**
+
+**A:** 看 `manifests` 字段：
+
+```bash
+skopeo inspect --raw docker://your-registry.example.com/my-namespace/sengokucola_maibot:latest | jq '.mediaType, (.manifests[]? | "\(.platform.os)/\(.platform.architecture): \(.digest)")'
+```
+
+- 输出 `manifest.list.v2+json` 或 `image.index.v1+json` + 多条平台记录 → 多架构，直接 `docker pull` 即可
+- 输出 `manifest.v2+json` / `image.manifest.v1+json`（没有 `manifests` 字段）→ 单架构，按下文 Q10 处理
+
 
 **Q5: 如何同步和拉取私有镜像？**
 
@@ -266,6 +281,65 @@ skopeo inspect docker://your-registry.example.com/my-namespace/bitnami_redis:7
 2. 确认私有镜像的访问权限是否正确（如 GitHub Token 是否有足够的权限）
 3. 检查 GitHub Actions 日志中的具体错误信息
 4. 确认私有镜像是否存在且可访问
+
+**Q8: 报错 `denied: unknown manifest class for application/vnd.oci.empty.v1+json` 怎么办？**
+
+**A:** 这不是认证问题，而是**阿里云 ACR 拒绝 OCI attestation 清单**。
+
+- **原因**：上游镜像用 `docker buildx build` 构建时默认会附带 provenance / SBOM 证明清单（attestation manifest），
+  它的特征就是 config 为 `application/vnd.oci.empty.v1+json`（空描述符）。
+  阿里云 ACR 个人版的制品类型白名单里没有这一类，于是在**清单上传阶段**直接拒绝，
+  报错里能看到 `denied:` 但后面跟的是 manifest class，而不是权限描述。
+- **典型现象**：日志里 `Copying N images generated from N images in list`，
+  卡在 `copying image 2/4 from manifest list`——第 1 个真实平台推成功了，
+  第 2 个是 attestation 清单被拒。凡是「平台数 × 2」的镜像都属于这一类。
+- **本工作流的处理**：`copy_image()` 分两步降级：
+  1. 原样整份复制，失败后……
+  2. **逐平台复制**（`--override-os/--override-arch`），让目标端每个制品都是普通单架构 manifest，
+     从根上绕开空描述符；随后再用 `skopeo copy --multi-arch index-only` **重建索引**
+     （此时各平台子清单已在目标仓库里，只需推一个只含平台条目的 index/list）。
+- **结果**：索引重建成功 → 目标端仍是完整多架构清单，`docker pull` 行为与普通镜像完全一致；
+  索引重建失败 → 目标端保持单架构 tag（各平台仍按 digest 并存），处理方法见 Q10。
+- **上游根治**：如果是你自己的镜像，构建时加 `provenance: false, sbom: false`（buildx），
+  例如 `docker/build-push-action@v6` 的 `with:` 里加上这两项。
+- **为什么以前能成功、后来突然失败**：阿里云侧的制品类型准入规则会变，
+  而上游镜像也在持续重建。同一个 tag 的内容从「普通 manifest list」变成
+  「带 attestation 的 OCI index」后，失败会立刻开始，且**每个 cron 周期重复一次**。
+
+**Q9: 为什么邮箱里收到的主题和实际结果对不上？**
+
+**A:** 旧版工作流用 `${{ env.FAILURE_COUNT > 0 && ... }}` 判断主题，但这些计数只写进了
+`$GITHUB_ENV`，在 workflow 解析期的 `env` 上下文里并不存在，恒为空，导致主题不可信。
+现已改为在邮件步骤通过 `env:` 读取计数、再在 shell 内用 `$FAILURE_COUNT` 判断，
+主题分为四种：`✅ 成功` / `⚠️ 部分失败` / `❌ 失败` / `☕ 无新镜像`。
+
+**Q10: 日志里出现「索引重建失败」，arm64 机器拉不到镜像怎么办？**
+
+**A:** 这表示目标端只留下了单架构 tag（tag 指向最后一个被推送的平台，通常是 arm64）。
+先按 Q4.1 确认目标端形态，再按需处理：
+
+```bash
+# 1. 查看目标端有哪些平台及其 digest
+skopeo inspect --raw docker://your-registry.example.com/my-namespace/sengokucola_maibot:latest \
+  | jq '.manifests[]? | {os: .platform.os, arch: .platform.architecture, digest}'
+
+# 2. 按 digest 拉取指定平台（最稳，跨平台都适用）
+docker pull your-registry.example.com/my-namespace/sengokucola_maibot@sha256:<digest>
+
+# 3. 或直接声明平台（本机为 arm64 时配合 QEMU 也可用）
+docker pull --platform linux/arm64 your-registry.example.com/my-namespace/sengokucola_maibot:latest
+```
+
+在 `docker-compose.yml` / K8s manifest 里可以写成 digest 形式：
+
+```yaml
+services:
+  app:
+    image: your-registry.example.com/my-namespace/sengokucola_maibot@sha256:<arm64-digest>
+```
+
+注意：digest 方式不会随上游更新自动跟进，更换版本时需要重新查一次 digest。
+
 
 ---
 

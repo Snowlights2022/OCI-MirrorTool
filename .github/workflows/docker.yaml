@@ -32,6 +32,15 @@ jobs:
   build:
     name: Sync Images
     runs-on: ubuntu-latest
+    # 超时兜底：正常一轮 2-4 分钟；逐平台复制 + 索引重建会稍长。
+    # 没有这个上限时，Docker Hub 长时间无响应会让 job 挂满 6 小时才被判失败。
+    timeout-minutes: 60
+    # 同一时间只允许一个同步任务：重叠运行会并发推送同一批 tag，
+    # 两个 run 互相覆盖 manifest，产生难以定位的偶发失败。
+    # cancel-in-progress: false —— 不打断进行中的同步，只排队等待。
+    concurrency:
+      group: oci-mirror-sync
+      cancel-in-progress: false
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -58,7 +67,13 @@ jobs:
       - name: Sync and Push to Aliyun
         id: sync_step
         run: |
-          echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
+          # 阿里云登录是硬依赖：一旦凭证过期/失效，下面每个镜像都会以
+          # "unauthorized / denied" 失败，邮件里就会凭空多出 N 条同步失败。
+          # 这里改为立即失败，让日志和邮件直接指向真正的原因。
+          if ! echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"; then
+              echo ">>> ❌ 阿里云镜像仓库登录失败：请检查 ALIYUN_REGISTRY / ALIYUN_REGISTRY_USER / ALIYUN_REGISTRY_PASSWORD 这三个 Secret"
+              exit 1
+          fi
           
           # 登录各注册表（失败不阻断，仅影响对应私有镜像的同步）
           # Docker Hub
@@ -87,29 +102,191 @@ jobs:
           FAILURE_COUNT=0
           SKIPPED_COUNT=0
 
+          # -------------------------------------------------------------------
+          # 摘要比对：忽略 attestation 子清单
+          # buildx 生成的 provenance/SBOM 证明清单 config 为
+          # application/vnd.oci.empty.v1+json，阿里云 ACR 会拒绝该 manifest class，
+          # 因此它既不能推、也不该参与"是否已一致"的判断。
+          # 只比对真实平台的 image digest；空结果表示源不是标准 manifest list
+          # （例如单架构索引），此时回退到 config digest 比对。
+          # -------------------------------------------------------------------
+          platform_fingerprint() {
+              echo "$1" | jq -r '
+                  [ .manifests[]?
+                    | select((.platform.os // "") != "unknown")
+                    | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
+                    | "\(.platform.os)/\(.platform.architecture)/\(.platform.variant // ""):\(.digest)"
+                  ] | sort | join("|")' 2>/dev/null || echo ""
+          }
+
+          src_fingerprint() {
+              local fp=$(platform_fingerprint "$1")
+              if [ -n "$fp" ]; then
+                  printf '%s' "$fp"
+              else
+                  echo "$1" | jq -r '.config.digest // empty' 2>/dev/null || echo ""
+              fi
+          }
+
           is_up_to_date() {
               local compare_target="$1"
               local compare_raw="$2"
-              local compare_is_list="$3"
 
-              if [[ "$compare_is_list" == *"manifest.list"* ]] || [[ "$compare_is_list" == *"index"* ]]; then
-                  local src_fp=$(echo "$compare_raw" | jq '[.manifests[]?.digest] | sort | join("|")' -r 2>/dev/null || echo "")
-                  if [ -n "$src_fp" ] && skopeo inspect "docker://$compare_target" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                      local dst_raw=$(skopeo inspect --raw "docker://$compare_target" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" 2>/dev/null || echo "")
-                      local dst_fp=$(echo "$dst_raw" | jq '[.manifests[]?.digest] | sort | join("|")' -r 2>/dev/null || echo "")
-                      if [ -n "$dst_fp" ] && [ "$src_fp" = "$dst_fp" ]; then
-                          return 0
-                      fi
+              local src_fp=$(src_fingerprint "$compare_raw")
+              if [ -z "$src_fp" ]; then
+                  return 1
+              fi
+
+              local dst_raw=$(skopeo inspect --raw "docker://$compare_target" \
+                  --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" 2>/dev/null || echo "")
+              if [ -z "$dst_raw" ]; then
+                  return 1
+              fi
+
+              local dst_fp=$(src_fingerprint "$dst_raw")
+              if [ -n "$dst_fp" ] && [ "$src_fp" = "$dst_fp" ]; then
+                  return 0
+              fi
+
+              return 1
+          }
+
+          # -------------------------------------------------------------------
+          # 带重试的复制：Docker Hub 侧瞬时抖动（429/5xx/超时）很常见，
+          # 失败一次就永久记为"同步失败"会污染邮件可信度。
+          # -------------------------------------------------------------------
+          retry_copy() {
+              local src="$1"
+              local dst="$2"
+              local dest_creds="$3"
+              local max_attempts="$4"
+              shift 4
+              local attempt=1
+              while [ "$attempt" -le "$max_attempts" ]; do
+                  if skopeo copy --all "$src" "$dst" --dest-creds "$dest_creds" "$@" 2>&1; then
+                      return 0
+                  fi
+                  echo ">>> ↻ 第 ${attempt}/${max_attempts} 次尝试失败"
+                  attempt=$((attempt + 1))
+                  [ "$attempt" -le "$max_attempts" ] && sleep 10
+              done
+              return 1
+          }
+
+          # -------------------------------------------------------------------
+          # 把源清单里的 attestation 子清单剔除，保留多架构结构
+          # -------------------------------------------------------------------
+          strip_attestations() {
+              echo "$1" | jq -c '
+                  .manifests |= [ .[]?
+                      | select((.platform.os // "") != "unknown")
+                      | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
+                  ]' 2>/dev/null || echo ""
+          }
+
+          # -------------------------------------------------------------------
+          # 逐平台复制 + 索引重建，彻底绕开"含空描述符的 OCI index"。
+          #
+          # 为什么不做"改写后的 index 再整份复制"：过滤后的 index 只存在于本地，
+          # 其子清单仍在远端 registry，skopeo 无法用本地 oci: 引用去远端取子清单，
+          # 那样必然 manifest unknown。
+          #
+          # 所以分两步：
+          #   2a) 逐个平台单独推 —— 目标端每个制品都是普通的单架构 manifest，
+          #       不产生 application/vnd.oci.empty.v1+json（这正是阿里云拒绝的东西）。
+          #   2b) 再用 --multi-arch index-only 让 skopeo 重新组装一个索引：
+          #       此时两个平台的子清单都已在目标仓库里，skopeo 只需补缺失的那个，
+          #       然后推一个只含平台子清单的 index/list（不含 attestation）。
+          #       成功 → 目标端仍是完整多架构，docker pull 自动选平台；
+          #       失败 → 保持 2a 的结果（单架构 tag），并打警告，不算同步失败。
+          # -------------------------------------------------------------------
+          copy_per_platform() {
+              local index_json="$1"
+              local src_ref="$2"
+              local dst="$3"
+              local dest_creds="$4"
+
+              local plats
+              plats=$(echo "$index_json" | jq -r '
+                  .manifests[]?
+                  | select((.platform.os // "") != "unknown")
+                  | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
+                  | "\(.platform.os) \(.platform.architecture) \(.platform.variant // "")"' 2>/dev/null || echo "")
+
+              if [ -z "$plats" ]; then
+                  echo ">>> 未在清单中找到可用平台"
+                  return 1
+              fi
+
+              local plat_count=0
+              local os arch variant
+              while IFS=' ' read -r os arch variant; do
+                  [ -z "$os" ] && continue
+                  echo ">>> 按平台推送: ${os}/${arch}${variant:+/$variant}"
+                  if ! retry_copy "$src_ref" "$dst" "$dest_creds" 3 \
+                          --override-os "$os" --override-arch "$arch" ${variant:+--override-variant "$variant"}; then
+                      echo ">>> ✗ 平台 ${os}/${arch} 推送失败"
+                      return 1
+                  fi
+                  plat_count=$((plat_count + 1))
+              done <<< "$plats"
+
+              # 2b) 索引重建：仅在确实推了多个平台时才有意义
+              #
+              # 依据 skopeo-copy(1)：`--multi-arch index-only` "creates a sparse manifest
+              # list, which usually fail unless the referenced per-architecture images are
+              # already present in the destination"。上面的逐平台推送正好满足这个前提。
+              # 注意不要和 --all 同用：--all 的语义是"复制列表里的全部镜像以及列表本身"，
+              # 与 index-only 的"只复制索引"冲突。
+              if [ "$plat_count" -gt 1 ]; then
+                  echo ">>> 索引重建: 组装 ${plat_count} 平台的多架构清单（index-only，不带 attestation）"
+                  # 这里直接调 skopeo 而不是 retry_copy：retry_copy 写死了 --all，
+                  # 而 index-only 必须与 --all 互斥。
+                  if skopeo copy --multi-arch index-only \
+                          "$src_ref" "$dst" --dest-creds "$dest_creds" 2>&1; then
+                      echo ">>> ✓ 目标端已恢复为多架构清单"
+                  else
+                      echo ">>> ⚠️ 索引重建失败：目标端将保持单架构 tag（各平台仍可按 digest 拉取）"
+                  fi
+              fi
+
+              return 0
+          }
+
+          # -------------------------------------------------------------------
+          # 复制策略：
+          #   1) 原样整份复制（单次尝试，快速失败）—— 不含 attestation 的镜像走这里，
+          #      保留完整的 manifest list。
+          #   2) 逐平台复制 + 索引重建（每平台带 3 次重试）—— 源 index 里含 buildx
+          #      attestation 时触发，因为阿里云 ACR 拒绝 application/vnd.oci.empty.v1+json。
+          #   策略 1 只试一次是有意的：对 attestation 镜像重试 3 次纯属浪费
+          #   （每次失败都要走完一遍 manifest 上传），真正的瞬时抖动由逐平台的重试兜住。
+          # -------------------------------------------------------------------
+          copy_image() {
+              local src_ref="$1"
+              local dst="$2"
+              local dest_creds="$3"
+              local src_raw="$4"
+
+              echo ">>> 策略 1/2: 整份复制（含全部子清单）"
+              if retry_copy "$src_ref" "$dst" "$dest_creds" 1; then
+                  return 0
+              fi
+
+              local filtered
+              filtered=$(strip_attestations "$src_raw")
+              local real_plats=0
+              if [ -n "$filtered" ]; then
+                  real_plats=$(echo "$filtered" | jq -r '.manifests | length' 2>/dev/null || echo 0)
+              fi
+
+              if [ "${real_plats:-0}" -gt 0 ]; then
+                  echo ">>> 策略 2/2: 逐平台复制（${real_plats} 个平台，剔除 attestation 子清单）"
+                  if copy_per_platform "$filtered" "$src_ref" "$dst" "$dest_creds"; then
+                      return 0
                   fi
               else
-                  local src_digest=$(echo "$compare_raw" | jq -r '.config.digest // empty' 2>/dev/null || echo "")
-                  if [ -n "$src_digest" ] && skopeo inspect "docker://$compare_target" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                      local dst_raw=$(skopeo inspect --raw "docker://$compare_target" --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" 2>/dev/null || echo "")
-                      local dst_digest=$(echo "$dst_raw" | jq -r '.config.digest // empty' 2>/dev/null || echo "")
-                      if [ -n "$dst_digest" ] && [ "$src_digest" = "$dst_digest" ]; then
-                          return 0
-                      fi
-                  fi
+                  echo ">>> 源不是多平台清单，无平台级降级可用"
               fi
 
               return 1
@@ -123,6 +300,12 @@ jobs:
               raw_image=$(echo "$line" | awk '{print $1}')
               # 去除 @sha256:... 摘要后缀
               full_image="${raw_image%%@*}"
+              # 源引用：保留用户写死的 digest（若未写则等于 full_image）
+              if [[ "$raw_image" == *"@"* ]]; then
+                  src_ref="${full_image}@${raw_image##*@}"
+              else
+                  src_ref="$full_image"
+              fi
               
               # -------------------------------------------------------------------
               # 阿里云 ACR 仓库名不支持多级路径（如 sengokucola/maibot），
@@ -136,11 +319,9 @@ jobs:
               target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$repo_name"
 
               # 比较源和目标是否一致，避免重复同步浮动 tag
-              # 多架构: 比较 manifest list 中各平台 digest（内容寻址，不受 JSON 重序列化影响）
-              # 单架构: 直接比较 image digest
-              raw=$(skopeo inspect --raw "docker://$full_image" 2>/dev/null || echo "")
-              is_list=$(echo "$raw" | jq -r '.mediaType // ""' 2>/dev/null || echo "")
-              if is_up_to_date "$target_image" "$raw" "$is_list"; then
+              # 多架构: 比较各平台 image digest（忽略 attestation）；单架构: 比较 config digest
+              raw=$(skopeo inspect --raw "docker://$src_ref" 2>/dev/null || echo "")
+              if is_up_to_date "$target_image" "$raw"; then
                   echo ">>> Skip (digest 一致): $full_image"
                   SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
                   continue
@@ -155,7 +336,7 @@ jobs:
 
               # 使用 skopeo copy 直接在两个 registry 间复制（保留所有平台，不占本地磁盘）
               echo ">>> Syncing: $full_image → $target_image"
-              if skopeo copy --all "docker://$full_image" "docker://$target_image" --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD"; then
+              if copy_image "$src_ref" "docker://$target_image" "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" "$raw"; then
                   SYNC_SUMMARY="${SYNC_SUMMARY}\n✅ ${full_image}"
                   SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
               else
@@ -165,30 +346,56 @@ jobs:
           done < images.txt
 
           # 写入环境变量供后续步骤使用
-          echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
-          echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
-          echo "SKIPPED_COUNT=$SKIPPED_COUNT" >> $GITHUB_ENV
           {
-            echo 'SYNC_RESULT<<EOF'
+            echo "SUCCESS_COUNT=$SUCCESS_COUNT"
+            echo "FAILURE_COUNT=$FAILURE_COUNT"
+            echo "SKIPPED_COUNT=$SKIPPED_COUNT"
+          } >> "$GITHUB_ENV"
+          {
+            echo 'SYNC_RESULT<<SYNC_RESULT_EOF'
             echo -e "$SYNC_SUMMARY"
-            echo 'EOF'
-          } >> $GITHUB_ENV
+            echo 'SYNC_RESULT_EOF'
+          } >> "$GITHUB_ENV"
 
       - name: 发送 Email 通知
         if: always()
+        env:
+          SUCCESS_COUNT: ${{ env.SUCCESS_COUNT }}
+          SKIPPED_COUNT: ${{ env.SKIPPED_COUNT }}
+          FAILURE_COUNT: ${{ env.FAILURE_COUNT }}
+          SYNC_RESULT: ${{ env.SYNC_RESULT }}
         run: |
-          printf -v SUBJECT '%s' "${{ (env.FAILURE_COUNT > 0 && '❌ AliCR镜像同步失败') ||
-                                       (env.SUCCESS_COUNT > 0 && '✅ AliCR镜像同步成功') ||
-                                       '☕ 同步任务完成 (无新镜像)' }}"
-          printf -v DETAIL_URL '%s' "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          BODY=$(printf '%s\n\n%s\n\n%s\n\n%s' \
+          # 注意：这里必须用 shell 变量（$VAR），不能用 ${{ env.VAR }}。
+          # 前者在运行时展开，能看到本步骤 env: 从 GITHUB_ENV 取到的真实计数；
+          # 后者在 workflow 解析期展开，此时 env 上下文里根本没有这些键（恒为空），
+          # 原来的 `env.FAILURE_COUNT > 0` 因此永远为假，主题恒不可信。
+          SUCCESS_COUNT="${SUCCESS_COUNT:-0}"
+          SKIPPED_COUNT="${SKIPPED_COUNT:-0}"
+          FAILURE_COUNT="${FAILURE_COUNT:-0}"
+
+          if [ "$FAILURE_COUNT" -gt 0 ] && [ "$SUCCESS_COUNT" -gt 0 ]; then
+            SUBJECT="⚠️ AliCR镜像同步部分失败 (成功 ${SUCCESS_COUNT} / 失败 ${FAILURE_COUNT})"
+          elif [ "$FAILURE_COUNT" -gt 0 ]; then
+            SUBJECT="❌ AliCR镜像同步失败 (失败 ${FAILURE_COUNT})"
+          elif [ "$SUCCESS_COUNT" -gt 0 ]; then
+            SUBJECT="✅ AliCR镜像同步成功 (${SUCCESS_COUNT} 个)"
+          else
+            SUBJECT="☕ 同步任务完成 (无新镜像)"
+          fi
+
+          DETAIL_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY=$(printf '%s\n\n%s\n\n%s\n\n%s\n\n%s\n\n%s' \
             "阿里云镜像同步报告" \
             "━━━━━━━━━━━━━━━━━━" \
-            "统计: 成功 ${SUCCESS_COUNT:-0} | 跳过 ${SKIPPED_COUNT:-0} | 失败 ${FAILURE_COUNT:-0}" \
+            "统计: 成功 ${SUCCESS_COUNT} | 跳过 ${SKIPPED_COUNT} | 失败 ${FAILURE_COUNT}" \
             "详细结果: ${SYNC_RESULT:-无}" \
             "" \
             "查看详情: ${DETAIL_URL}")
-          curl -s -X POST https://api.resend.com/emails \
+          echo ">>> 邮件主题: $SUBJECT"
+
+          # --fail-with-body: Resend 返回 4xx/5xx 时让 curl 退出码非 0 并打印错误体，
+          # 避免"邮件根本没发出去"被 -s 静默吞掉。
+          if ! curl -sS --fail-with-body -X POST https://api.resend.com/emails \
             -H "Authorization: Bearer ${{ secrets.RESEND_API_KEY }}" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
@@ -196,5 +403,7 @@ jobs:
               --arg to "${{ secrets.EMAIL_RECIPIENT }}" \
               --arg subject "$SUBJECT" \
               --arg body "$BODY" \
-              '{from: $from, to: [$to], subject: $subject, text: $body}')"
+              '{from: $from, to: [$to], subject: $subject, text: $body}')"; then
+            echo ">>> ⚠️ 邮件发送失败（不影响镜像同步结果）"
+          fi
 

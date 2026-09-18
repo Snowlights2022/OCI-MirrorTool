@@ -1,0 +1,171 @@
+import { readFileSync } from "node:fs";
+import { parse } from "yaml";
+
+const text = readFileSync(process.argv[2], "utf8");
+let doc;
+try {
+  doc = parse(text);
+} catch (e) {
+  console.log("YAML PARSE FAILED:\n" + e.message);
+  process.exit(1);
+}
+console.log("== YAML PARSE OK ==");
+console.log("top-level keys:", Object.keys(doc).join(", "));
+console.log("jobs:", Object.keys(doc.jobs).join(", "));
+console.log("'on' triggers:", JSON.stringify(doc.on));
+
+const steps = doc.jobs.build.steps;
+console.log("\n== STEPS ==");
+steps.forEach((s, i) => {
+  const kind = s.uses ? `uses=${s.uses}` : `run(${s.run.split("\n").length} lines)`;
+  console.log(`  [${i}] ${s.name}  ->  ${kind}`);
+});
+
+const mail = steps.find((s) => (s.name ?? "").includes("Email"));
+
+console.log("\n== EMAIL STEP ==");
+console.log("env:", JSON.stringify(mail.env, null, 2));
+
+// --- simulate the shell-side subject logic with the values from the real run ---
+function subject(success, skipped, failure) {
+  success = String(success ?? 0);
+  skipped = String(skipped ?? 0);
+  failure = String(failure ?? 0);
+  if (+failure > 0 && +success > 0)
+    return `⚠️ AliCR镜像同步部分失败 (成功 ${success} / 失败 ${failure})`;
+  if (+failure > 0) return `❌ AliCR镜像同步失败 (失败 ${failure})`;
+  if (+success > 0) return `✅ AliCR镜像同步成功 (${success} 个)`;
+  return "☕ 同步任务完成 (无新镜像)";
+}
+console.log("\n== SUBJECT MATRIX (成功/跳过/失败) ==");
+for (const c of [
+  [0, 6, 0],
+  [4, 2, 0],
+  [3, 1, 1],
+  [0, 2, 4],
+  [undefined, 2, 0],
+]) {
+  console.log(`  ${JSON.stringify(c)} -> ${subject(...c)}`);
+}
+
+// --- reproduce the NEW jq filters in JS and run them over representative manifests ---
+const isAttestation = (m) =>
+  (m.platform?.os ?? "") === "unknown" ||
+  m.annotations?.["vnd.docker.reference.type"] === "attestation-manifest";
+
+function fingerprint(manifest) {
+  const fps = (manifest.manifests ?? [])
+    .filter((m) => (m.platform?.os ?? "") !== "unknown")
+    .filter((m) => m.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest")
+    .map((m) => `${m.platform.os}/${m.platform.architecture}/${m.platform.variant ?? ""}:${m.digest}`);
+  if (fps.length) return fps.sort().join("|");
+  return manifest.config?.digest ?? "";
+}
+
+function strip(manifest) {
+  return {
+    ...manifest,
+    manifests: (manifest.manifests ?? []).filter((m) => !isAttestation(m)),
+  };
+}
+
+// realistic buildkit output: 2 platforms + 2 attestation manifests
+const buildkitIndex = {
+  schemaVersion: 2,
+  mediaType: "application/vnd.oci.image.index.v1+json",
+  manifests: [
+    { mediaType: "application/vnd.oci.image.manifest.v1+json", digest: "sha256:aaaa", size: 1, platform: { architecture: "amd64", os: "linux" } },
+    { mediaType: "application/vnd.oci.image.manifest.v1+json", digest: "sha256:bbbb", size: 1, platform: { architecture: "arm64", os: "linux", variant: "v8" } },
+    {
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      digest: "sha256:3c9d6d26bc78a88d9ec7b099476bfd248a1f8c16a820bf0c0e456de9fb4ee1a4",
+      size: 566,
+      platform: { architecture: "unknown", os: "unknown" },
+      annotations: { "vnd.docker.reference.type": "attestation-manifest", "vnd.docker.reference.digest": "sha256:aaaa" },
+    },
+    {
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      digest: "sha256:cccc",
+      size: 566,
+      platform: { architecture: "unknown", os: "unknown" },
+      annotations: { "vnd.docker.reference.type": "attestation-manifest", "vnd.docker.reference.digest": "sha256:bbbb" },
+    },
+  ],
+};
+
+const aliyunIndex = { ...buildkitIndex, manifests: [buildkitIndex.manifests[0], buildkitIndex.manifests[1]] };
+
+const singleManifest = {
+  schemaVersion: 2,
+  mediaType: "application/vnd.docker.distribution.manifest.v2+json",
+  config: { mediaType: "application/vnd.docker.container.image.v1+json", digest: "sha256:config1", size: 100 },
+  layers: [],
+};
+
+const emptyConfigManifest = {
+  schemaVersion: 2,
+  mediaType: "application/vnd.oci.image.manifest.v1+json",
+  config: { mediaType: "application/vnd.oci.empty.v1+json", digest: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a", size: 2 },
+  layers: [],
+};
+
+console.log("\n== FINGERPRINT BEHAVIOUR ==");
+console.log("  src(buildkit index, 2 real + 2 attestation) =", fingerprint(buildkitIndex));
+console.log("  dst(aliyun, 2 real platforms)               =", fingerprint(aliyunIndex));
+console.log("  => 一致，跳过重推:", fingerprint(buildkitIndex) === fingerprint(aliyunIndex));
+console.log("  src(单架构 manifest)                         =", fingerprint(singleManifest));
+console.log("  src(只有空描述符的 attestation manifest)      =", JSON.stringify(fingerprint(emptyConfigManifest)));
+
+const stripped = strip(buildkitIndex);
+console.log("\n== STRIP ATTESTATIONS ==");
+console.log("  before:", buildkitIndex.manifests.length, "manifests");
+console.log(
+  "  after :",
+  stripped.manifests.length,
+  "manifests ->",
+  stripped.manifests.map((m) => `${m.platform.os}/${m.platform.architecture}${m.platform.variant ? "/" + m.platform.variant : ""}`).join(", ")
+);
+console.log("  残留 unknown 平台:", stripped.manifests.filter((m) => m.platform.os === "unknown").length);
+console.log("  index mediaType 保留:", stripped.mediaType);
+console.log("\n  逐平台推送计划:");
+for (const m of stripped.manifests) {
+  const p = m.platform;
+  console.log(`    --override-os ${p.os} --override-arch ${p.architecture}${p.variant ? ` --override-variant ${p.variant}` : ""}`);
+}
+
+const allAttestation = { ...buildkitIndex, manifests: [buildkitIndex.manifests[2], buildkitIndex.manifests[3]] };
+console.log("\n  病态输入（全部为 attestation）→ strip 后条目数:", strip(allAttestation).manifests.length, "（脚本据此跳过降级策略）");
+
+// --- structural checks on the workflow file itself ---
+console.log("\n== STRUCTURAL CHECKS ==");
+const syncRun = steps.find((s) => s.id === "sync_step").run;
+const checks = [
+  ["sync 步骤包含 platform_fingerprint", syncRun.includes("platform_fingerprint()")],
+  ["sync 步骤包含 strip_attestations", syncRun.includes("strip_attestations()")],
+  ["sync 步骤包含 copy_per_platform", syncRun.includes("copy_per_platform()")],
+  ["sync 步骤包含 retry_copy", syncRun.includes("retry_copy()")],
+  ["sync 步骤调用 copy_image", syncRun.includes("copy_image \"$src_ref\"")],
+  ["sync 步骤不再直接 skopeo copy --all 源镜像", !syncRun.includes("skopeo copy --all \"docker://$full_image\"")],
+  ["源 inspect 使用 src_ref", syncRun.includes('skopeo inspect --raw "docker://$src_ref"')],
+  ["GITHUB_ENV heredoc 使用唯一分隔符", syncRun.includes("SYNC_RESULT<<SYNC_RESULT_EOF")],
+  ["邮件步骤已移除 printf -v SUBJECT 表达式", !/printf -v SUBJECT '%s' "\$\{\{/.test(mail.run)],
+  ["邮件步骤注释里说明了旧写法（仅注释，非代码）", mail.run.split("\n").filter((l) => l.includes("env.FAILURE_COUNT")).every((l) => l.trim().startsWith("#"))],
+  ["SYNC_RESULT 改为专用 env 变量而非 shell 展开", mail.run.includes('"详细结果: ${SYNC_RESULT:-无}"')],
+  ["邮件步骤使用 shell 计数变量", mail.run.includes('FAILURE_COUNT="${FAILURE_COUNT:-0}"')],
+  ["curl 使用 --fail-with-body", mail.run.includes("--fail-with-body")],
+];
+let bad = 0;
+for (const [name, ok] of checks) {
+  if (!ok) bad++;
+  console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}`);
+}
+
+// heredoc / quote balance sanity for each run block
+console.log("\n== RUN BLOCK SANITY ==");
+for (const s of steps.filter((x) => x.run)) {
+  const lines = s.run.split("\n");
+  const heredocs = lines.filter((l) => /<<-?'?[A-Z_]+'?$/.test(l.trim()));
+  console.log(`  ${s.name}: ${lines.length} 行, heredoc 起始 ${heredocs.length} 个`);
+}
+console.log(bad === 0 ? "\n全部结构与逻辑检查通过" : `\n有 ${bad} 项检查未通过`);
+process.exit(bad === 0 ? 0 : 1);
